@@ -1,0 +1,40 @@
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+
+# Virtualenvs and Python caches
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# IDE/editor local state
+.idea/
+.vscode/
+
+# Build and packaging output
+dist/
+build/
+*.egg-info/
+
+# Harness outputs and local trace data
+artifacts/
+*.log
+*.trace
+
+# Native tool build output
+tools/search/ak_search
+
+# Ad-hoc recovered source outputs in the repository root
+/recovered_*.py
+
+sessions
+
+.DS_Store
+
+notes

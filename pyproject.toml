@@ -1,0 +1,22 @@
+[project]
+name = "algokiller-harness"
+version = "0.1.0"
+description = "Single-agent harness for reconstructing algorithms from arm64 trace data."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "litellm>=1.60.0",
+    "prompt-toolkit>=3.0.0",
+    "python-dotenv>=1.0.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+]
+
+[project.scripts]
+algokiller = "algokiller_harness.cli:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
