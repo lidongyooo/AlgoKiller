@@ -55,7 +55,7 @@ python run_algokiller.py --trace-file ./my_trace.log --mode ciphertext \
   "还原生成密文 a3b2c1... 的算法"
 
 python run_algokiller.py --trace-file ./my_trace.log --mode general \
-  "说明 x0 返回值是如何计算出来的"
+  "说明 9999 行 x0 返回值是如何计算出来的"
 ```
 
 ### 恢复会话
