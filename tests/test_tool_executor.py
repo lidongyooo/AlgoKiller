@@ -47,6 +47,10 @@ def test_builtin_tools_are_litellm_function_tools():
     assert TRACE_ALL_SEARCH_TOOL["function"]["parameters"]["properties"]["limit"]["minimum"] == 1
     assert TRACE_ALL_SEARCH_TOOL["function"]["parameters"]["properties"]["limit"]["maximum"] == 10
     assert "per file" in TRACE_ALL_SEARCH_TOOL["function"]["description"]
+    assert "existence/discovery" in TRACE_ALL_SEARCH_TOOL["function"]["description"]
+    assert "not producer or earliest-generation analysis" in TRACE_ALL_SEARCH_TOOL["function"]["description"]
+    assert "mem_w to the target buffer/address" in TRACE_ALL_SEARCH_TOOL["function"]["description"]
+    assert "fills the target content/address" in TRACE_ALL_SEARCH_TOOL["function"]["description"]
     assert "context" not in TRACE_CONTEXT_TOOL["function"]["parameters"]["properties"]
     assert TRACE_CONTEXT_TOOL["function"]["parameters"]["required"] == ["file_id", "line", "before", "after"]
     assert TRACE_CONTEXT_TOOL["function"]["parameters"]["properties"]["before"]["maximum"] == 100

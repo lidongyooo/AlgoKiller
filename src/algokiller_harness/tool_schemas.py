@@ -78,7 +78,8 @@ TRACE_SEARCH_TOOL = {
             "and hexdump ASCII text in very large traces. Every call must include file_id and exactly one "
             "of from_line or before_line, plus limit. before_line searches backward and returns "
             "nearest earlier matches first. file_id must be an integer file number from trace_files. "
-            "Use trace_all_search for cross-file discovery. Choose a search purpose before each call. For byte/hex "
+            "Use trace_all_search only for cross-file existence/discovery, then prove producers inside one "
+            "file with trace_search/trace_context. Choose a search purpose before each call. For byte/hex "
             "data starting with 0x, if the original query has no matches the harness automatically "
             "tries byte-reversed endian order; if that misses and the hex value has leading zeroes, "
             "it then tries the leading-zero-trimmed value and the byte-reversed trimmed value. "
@@ -129,10 +130,15 @@ TRACE_ALL_SEARCH_TOOL = {
     "function": {
         "name": "trace_all_search",
         "description": (
-            "Forward case-insensitive exact substring search across every opened .log trace file. "
-            "Only use this for cross-file discovery when the relevant file is unknown. Every returned "
-            "match includes its source file_id. limit is the maximum number of records to return per file "
-            "and must be between 1 and 10."
+            "Cross-file existence/discovery search across every opened .log trace file, not producer "
+            "or earliest-generation analysis. It accepts only query and limit. Use this only to learn "
+            "which file_id(s) contain a target substring when the relevant file is unknown. Do not infer "
+            "the target's earliest generation position from returned line order or the first returned hit. "
+            "Every returned match includes its source file_id. limit is the maximum number of records to "
+            "return per file and must be between 1 and 10. After choosing candidate file_id(s), prove the "
+            "producer inside that file with trace_search/trace_context by finding mem_w to the target "
+            "buffer/address, a call boundary whose dst/ret/hexdump fills the target content/address, or "
+            "equivalent data-flow evidence."
         ),
         "parameters": {
             "type": "object",

@@ -32,6 +32,10 @@ def test_ciphertext_prompt_contains_mode_goal():
     assert "from_line 与 before_line 中选择一个" in prompt
     assert "before_line 只搜索该行之前的内容并按最近命中优先返回" in prompt
     assert "trace_all_search 只接受 query 和 limit" in prompt
+    assert "trace_all_search 的返回只表示目标内容在哪些文件中出现过" in prompt
+    assert "不要依据返回行号先后、第一条命中或不同 file_id 之间的相对顺序判断目标内容最早的生成位置" in prompt
+    assert "寻找写入该地址/内容的 `mem_w`" in prompt
+    assert "调用函数通过 dst/ret/hexdump/参数填充目标内容地址的证据" in prompt
     assert "trace_search 和 trace_context 的条数参数最大值都是 100" in prompt
     assert "搜索 hex/字节数据时必须按字节处理" in prompt
     assert "当某次字节数据原序搜索未命中时，必须尝试 endian 反序再搜索一次" in prompt
@@ -64,6 +68,8 @@ def test_ciphertext_prompt_contains_mode_goal():
     assert "`11d208`" in prompt
     assert "对每个候选片段同时搜索原序和反序" in prompt
     assert "2-4 个高辨识度的 4 字节滑动片段搜索" in prompt
+    assert "只把它当作存在性证据：选择候选 file_id" in prompt
+    assert "不比较不同 file_id 的行号或返回顺序来判断全局最早生成点" in prompt
     assert "优先取最前面的可信命中作为“最早可见点”候选" in prompt
     assert "不是直接当作最终生成点" in prompt
     assert "最终输出/上报前生成点" in prompt

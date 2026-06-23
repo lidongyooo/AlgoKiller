@@ -52,7 +52,6 @@ class AskUserReviewAgent:
                 {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
             ],
             max_tokens=4096,
-            allowed_openai_params=['reasoning_effort'],
             **api_kwargs(api_key=self.api_key, api_base=self.api_base),
             **temperature_kwargs(model=self.model, temperature=self.temperature),
             **reasoning_effort_kwargs(model=self.model, reasoning_effort=self.reasoning_effort),

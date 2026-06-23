@@ -3,7 +3,7 @@
 This project uses local tools to inspect ARM64 trace text:
 
 - `trace_files`: list the `.log` files opened for the current trace directory, including `file_id`, size in MB, and line count. Files are numbered by descending size; `file_id=1` is the largest file.
-- `trace_all_search`: case-insensitive exact substring search across every opened `.log` file. Every call must include only `query` and `limit`; `limit` is the maximum number of records returned per file and must be between 1 and 10. Each returned match includes its source `file_id`.
+- `trace_all_search`: cross-file existence/discovery search across every opened `.log` file. Every call must include only `query` and `limit`; `limit` is the maximum number of records returned per file and must be between 1 and 10. Each returned match includes its source `file_id`. Use it only to learn which `file_id` values contain the target; do not infer the earliest producer or generation point from returned line order or the first hit.
 - `trace_search`: case-insensitive exact substring search for one indexed trace file. Every call must include a numeric `file_id`, `limit`, and exactly one of `from_line` or `before_line`. `from_line` searches forward; `before_line` searches only lines before that anchor and returns nearest earlier matches first. `limit` must be at most 100.
 - `trace_context`: line-based context around any trace file line. Every call must include `file_id` plus explicit `before` and `after`; each line-count value must be at most 100.
 
@@ -37,7 +37,7 @@ The hexdump rows are sorted by increasing memory address. The ASCII preview is u
 
 ## Workflow
 
-1. Call `trace_files` when file numbering is unknown, then search for the target: a function name, register result, memory address, relative address, constant, or hexdump ASCII. Use `trace_all_search` for cross-file discovery.
+1. Call `trace_files` when file numbering is unknown, then search for the target: a function name, register result, memory address, relative address, constant, or hexdump ASCII. Use `trace_all_search` only for cross-file existence discovery.
 2. Expand context around promising hits with the same `file_id` returned by `trace_search`. For calls, include setup instructions before `call func:`, the hexdump rows, `ret:`, and consuming instructions after the call.
 3. Follow data flow with repeated search:
    - choose one purpose before each search: locate a target instance, find the nearest writer/producer, trace an input source, verify an algorithm hypothesis, or confirm a consumer;
@@ -45,6 +45,7 @@ The hexdump rows are sorted by increasing memory address. The ASCII preview is u
    - for hex/byte data, retry byte-reversed endian order when the original byte order has no hits;
    - when a byte sequence is longer than 4 bytes and the full sequence has no hits, search 2-4 distinctive 4-byte sliding windows in both original and reversed byte order before expanding to more windows or 5-8 byte sequences;
    - treat the earliest hit as a candidate only; verify it lies on a credible data-flow path before using it as producer or generation evidence;
+   - after `trace_all_search` identifies candidate files, switch to `trace_search`/`trace_context` inside one `file_id` and prove generation by finding `mem_w` to the target buffer/address, a call boundary whose dst/ret/hexdump fills the target content/address, or equivalent data-flow evidence;
    - use `from_line` to page forward after a known hit;
    - use `before_line` to find the nearest producer or writer before a known sink/generation line;
    - search memory write addresses (`mem_w=0x...`) and read addresses (`mem_r=0x...`) to connect producers and consumers.

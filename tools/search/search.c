@@ -41,10 +41,11 @@ typedef struct {
 } AsciiBits;
 
 typedef struct {
-    size_t *offsets;
-    AsciiBits *bits;
+    size_t **offset_blocks;
+    AsciiBits **bit_blocks;
     uint64_t count;
-    uint64_t capacity;
+    uint64_t block_count;
+    uint64_t block_capacity;
 } LineIndex;
 
 typedef struct {
@@ -68,6 +69,7 @@ typedef struct {
 } MatchResult;
 
 typedef struct MultiFileThreadPool MultiFileThreadPool;
+typedef struct FileCandidate FileCandidate;
 
 typedef struct {
     pthread_t thread;
@@ -90,6 +92,22 @@ typedef struct {
     pthread_mutex_t queue_mutex;
 } AllSearchJob;
 
+typedef struct {
+    TraceStore *store;
+    FileCandidate *candidates;
+    uint32_t count;
+    uint32_t next_index;
+    int error;
+    pthread_mutex_t mutex;
+} IndexBuildJob;
+
+#define LINE_INDEX_BLOCK_SHIFT 16
+#define LINE_INDEX_BLOCK_LINES (UINT64_C(1) << LINE_INDEX_BLOCK_SHIFT)
+#define LINE_INDEX_BLOCK_MASK (LINE_INDEX_BLOCK_LINES - 1)
+
+static AsciiBits g_ascii_byte_bits[256];
+static pthread_once_t g_ascii_byte_bits_once = PTHREAD_ONCE_INIT;
+
 struct MultiFileThreadPool {
     pthread_mutex_t mutex;
     pthread_cond_t start_cond;
@@ -107,6 +125,7 @@ static const unsigned char *bmh_find(const BmhSearcher *searcher,
                                      const unsigned char *haystack,
                                      size_t haystack_len);
 static void search_pool_destroy(MultiFileThreadPool *pool);
+static uint32_t default_search_thread_count(void);
 
 static void usage(FILE *stream) {
     fprintf(stream,
@@ -225,11 +244,21 @@ static void unmap_file(MappedFile *mapped) {
 }
 
 static void line_index_destroy(LineIndex *index) {
-    if (index->offsets != NULL && index->capacity > 0) {
-        munmap(index->offsets, (size_t)index->capacity * sizeof(*index->offsets));
+    if (index->offset_blocks != NULL) {
+        for (uint64_t i = 0; i < index->block_count; i++) {
+            if (index->offset_blocks[i] != NULL) {
+                munmap(index->offset_blocks[i], (size_t)LINE_INDEX_BLOCK_LINES * sizeof(**index->offset_blocks));
+            }
+        }
+        free(index->offset_blocks);
     }
-    if (index->bits != NULL && index->capacity > 0) {
-        munmap(index->bits, (size_t)index->capacity * sizeof(*index->bits));
+    if (index->bit_blocks != NULL) {
+        for (uint64_t i = 0; i < index->block_count; i++) {
+            if (index->bit_blocks[i] != NULL) {
+                munmap(index->bit_blocks[i], (size_t)LINE_INDEX_BLOCK_LINES * sizeof(**index->bit_blocks));
+            }
+        }
+        free(index->bit_blocks);
     }
     memset(index, 0, sizeof(*index));
 }
@@ -256,10 +285,29 @@ static inline void ascii_bits_add(AsciiBits *bits, unsigned char c) {
     }
 }
 
+static inline AsciiBits ascii_bits_or(AsciiBits lhs, AsciiBits rhs) {
+    lhs.lo |= rhs.lo;
+    lhs.hi |= rhs.hi;
+    return lhs;
+}
+
+static void init_ascii_byte_bits(void) {
+    for (size_t i = 0; i < 256; i++) {
+        g_ascii_byte_bits[i] = ascii_bits_empty();
+        ascii_bits_add(&g_ascii_byte_bits[i], fold_ascii_byte((unsigned char)i));
+    }
+}
+
+static const AsciiBits *ascii_byte_bit_table(void) {
+    pthread_once(&g_ascii_byte_bits_once, init_ascii_byte_bits);
+    return g_ascii_byte_bits;
+}
+
 static AsciiBits ascii_bits_for_text(const unsigned char *text, size_t len) {
     AsciiBits bits = ascii_bits_empty();
+    const AsciiBits *table = ascii_byte_bit_table();
     for (size_t i = 0; i < len; i++) {
-        ascii_bits_add(&bits, fold_ascii_byte(text[i]));
+        bits = ascii_bits_or(bits, table[text[i]]);
     }
     return bits;
 }
@@ -322,94 +370,117 @@ static LineView effective_search_line(LineView line) {
     return line;
 }
 
-static LineView search_line_for_index(const IndexedFile *file, uint64_t line_no) {
-    size_t offset = file->index.offsets[line_no - 1];
-    LineView line = line_at_offset(file->mapped.data, file->mapped.size, offset);
-    return effective_search_line(line);
-}
-
-static uint64_t count_line_starts(const MappedFile *mapped) {
-    if (mapped->size == 0) {
+static int line_index_grow_block_arrays(LineIndex *index) {
+    if (index->block_count < index->block_capacity) {
         return 0;
     }
-
-    uint64_t count = 1;
-    const unsigned char *cursor = mapped->data;
-    const unsigned char *end = mapped->data + mapped->size;
-    while (cursor < end) {
-        const unsigned char *newline = memchr(cursor, '\n', (size_t)(end - cursor));
-        if (newline == NULL) {
-            break;
-        }
-        if (newline + 1 < end) {
-            count++;
-        }
-        cursor = newline + 1;
-    }
-    return count;
-}
-
-static int line_index_reserve(LineIndex *index, uint64_t capacity) {
-    if (capacity == 0) {
-        return 0;
-    }
-    if (capacity > (uint64_t)(SIZE_MAX / sizeof(*index->offsets)) ||
-        capacity > (uint64_t)(SIZE_MAX / sizeof(*index->bits))) {
-        fprintf(stderr, "line index too large\n");
+    uint64_t new_capacity = index->block_capacity == 0 ? 8 : index->block_capacity * 2;
+    if (new_capacity < index->block_capacity ||
+        new_capacity > (uint64_t)(SIZE_MAX / sizeof(*index->offset_blocks)) ||
+        new_capacity > (uint64_t)(SIZE_MAX / sizeof(*index->bit_blocks))) {
+        fprintf(stderr, "line index block table too large\n");
         return 1;
     }
 
-    size_t offset_bytes = (size_t)capacity * sizeof(*index->offsets);
+    size_t offset_bytes = (size_t)new_capacity * sizeof(*index->offset_blocks);
+    size_t bit_bytes = (size_t)new_capacity * sizeof(*index->bit_blocks);
+    size_t old_offset_bytes = (size_t)index->block_capacity * sizeof(*index->offset_blocks);
+    size_t old_bit_bytes = (size_t)index->block_capacity * sizeof(*index->bit_blocks);
+
+    size_t **new_offsets = realloc(index->offset_blocks, offset_bytes);
+    if (new_offsets == NULL) {
+        return 1;
+    }
+    index->offset_blocks = new_offsets;
+    memset((unsigned char *)index->offset_blocks + old_offset_bytes, 0, offset_bytes - old_offset_bytes);
+
+    AsciiBits **new_bits = realloc(index->bit_blocks, bit_bytes);
+    if (new_bits == NULL) {
+        return 1;
+    }
+    index->bit_blocks = new_bits;
+    memset((unsigned char *)index->bit_blocks + old_bit_bytes, 0, bit_bytes - old_bit_bytes);
+
+    index->block_capacity = new_capacity;
+    return 0;
+}
+
+static int line_index_add_block(LineIndex *index) {
+    if (line_index_grow_block_arrays(index) != 0) {
+        return 1;
+    }
+
+    size_t offset_bytes = (size_t)LINE_INDEX_BLOCK_LINES * sizeof(**index->offset_blocks);
+    size_t bit_bytes = (size_t)LINE_INDEX_BLOCK_LINES * sizeof(**index->bit_blocks);
     void *offsets = mmap(NULL, offset_bytes, PROT_READ | PROT_WRITE,
                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (offsets == MAP_FAILED) {
-        fprintf(stderr, "mmap failed while preallocating line index: %s\n", strerror(errno));
+        fprintf(stderr, "mmap failed while allocating line index block: %s\n", strerror(errno));
         return 1;
     }
 
-    size_t bit_bytes = (size_t)capacity * sizeof(*index->bits);
     void *bits = mmap(NULL, bit_bytes, PROT_READ | PROT_WRITE,
                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (bits == MAP_FAILED) {
-        fprintf(stderr, "mmap failed while preallocating line bitmap index: %s\n", strerror(errno));
+        fprintf(stderr, "mmap failed while allocating line bitmap block: %s\n", strerror(errno));
         munmap(offsets, offset_bytes);
         return 1;
     }
 
-    index->offsets = (size_t *)offsets;
-    index->bits = (AsciiBits *)bits;
-    index->capacity = capacity;
+    index->offset_blocks[index->block_count] = (size_t *)offsets;
+    index->bit_blocks[index->block_count] = (AsciiBits *)bits;
+    index->block_count++;
     return 0;
+}
+
+static int line_index_append(LineIndex *index, size_t offset, AsciiBits bits) {
+    uint64_t in_block = index->count & LINE_INDEX_BLOCK_MASK;
+    if (in_block == 0 && line_index_add_block(index) != 0) {
+        return 1;
+    }
+    uint64_t block = index->count >> LINE_INDEX_BLOCK_SHIFT;
+    index->offset_blocks[block][in_block] = offset;
+    index->bit_blocks[block][in_block] = bits;
+    index->count++;
+    return 0;
+}
+
+static inline size_t line_index_offset(const LineIndex *index, uint64_t line_no) {
+    uint64_t pos = line_no - 1;
+    return index->offset_blocks[pos >> LINE_INDEX_BLOCK_SHIFT][pos & LINE_INDEX_BLOCK_MASK];
+}
+
+static inline AsciiBits line_index_bits(const LineIndex *index, uint64_t line_no) {
+    uint64_t pos = line_no - 1;
+    return index->bit_blocks[pos >> LINE_INDEX_BLOCK_SHIFT][pos & LINE_INDEX_BLOCK_MASK];
+}
+
+static LineView search_line_for_index(const IndexedFile *file, uint64_t line_no) {
+    size_t offset = line_index_offset(&file->index, line_no);
+    LineView line = line_at_offset(file->mapped.data, file->mapped.size, offset);
+    return effective_search_line(line);
 }
 
 static int build_line_index(const MappedFile *mapped, LineIndex *index) {
     memset(index, 0, sizeof(*index));
-    uint64_t line_count = count_line_starts(mapped);
-    if (line_index_reserve(index, line_count) != 0) {
-        return 1;
-    }
-    if (line_count == 0) {
+    if (mapped->size == 0) {
         return 0;
     }
 
     const unsigned char *end = mapped->data + mapped->size;
     const unsigned char *line_start = mapped->data;
     while (line_start < end) {
-        if (index->count >= index->capacity) {
-            fprintf(stderr, "line index overflow while building index\n");
-            return 1;
-        }
         const unsigned char *newline = memchr(line_start, '\n', (size_t)(end - line_start));
         const unsigned char *line_end = newline == NULL ? end : newline;
-        size_t offset = (size_t)(line_start - mapped->data);
         LineView line;
         line.start = line_start;
         line.len = (size_t)(line_end - line_start);
         LineView effective = effective_search_line(line);
+        size_t offset = (size_t)(line_start - mapped->data);
 
-        index->offsets[index->count] = offset;
-        index->bits[index->count] = ascii_bits_for_text(effective.start, effective.len);
-        index->count++;
+        if (line_index_append(index, offset, ascii_bits_for_text(effective.start, effective.len)) != 0) {
+            return 1;
+        }
 
         if (newline == NULL || newline + 1 >= end) {
             break;
@@ -451,7 +522,7 @@ static bool indexed_line_start(const IndexedFile *file, uint64_t line_no, size_t
     if (line_no == 0 || line_no > file->index.count) {
         return false;
     }
-    *offset_out = file->index.offsets[line_no - 1];
+    *offset_out = line_index_offset(&file->index, line_no);
     return true;
 }
 
@@ -465,11 +536,11 @@ static void trace_store_destroy(TraceStore *store) {
     memset(store, 0, sizeof(*store));
 }
 
-typedef struct {
+struct FileCandidate {
     char *path;
     char *name;
     size_t size;
-} FileCandidate;
+};
 
 static int compare_candidates_desc_size(const void *lhs, const void *rhs) {
     const FileCandidate *a = (const FileCandidate *)lhs;
@@ -550,6 +621,80 @@ static int discover_log_files(const char *dir_path, FileCandidate **items_out, u
     return 0;
 }
 
+static void *index_build_worker_main(void *arg) {
+    IndexBuildJob *job = (IndexBuildJob *)arg;
+    while (true) {
+        pthread_mutex_lock(&job->mutex);
+        if (job->error != 0 || job->next_index >= job->count) {
+            pthread_mutex_unlock(&job->mutex);
+            break;
+        }
+        uint32_t index = job->next_index++;
+        pthread_mutex_unlock(&job->mutex);
+
+        if (indexed_file_open(job->candidates[index].path,
+                              job->candidates[index].name,
+                              &job->store->files[index]) != 0) {
+            pthread_mutex_lock(&job->mutex);
+            job->error = 1;
+            pthread_mutex_unlock(&job->mutex);
+            break;
+        }
+        job->store->files[index].id = index + 1;
+    }
+    return NULL;
+}
+
+static int trace_store_build_indexes_parallel(TraceStore *store,
+                                              FileCandidate *candidates,
+                                              uint32_t count) {
+    uint32_t thread_count = default_search_thread_count();
+    if (thread_count > count) {
+        thread_count = count;
+    }
+    if (thread_count < 1) {
+        thread_count = 1;
+    }
+
+    IndexBuildJob job;
+    memset(&job, 0, sizeof(job));
+    job.store = store;
+    job.candidates = candidates;
+    job.count = count;
+    if (pthread_mutex_init(&job.mutex, NULL) != 0) {
+        return 1;
+    }
+
+    pthread_t *threads = calloc(thread_count, sizeof(*threads));
+    if (threads == NULL) {
+        pthread_mutex_destroy(&job.mutex);
+        return 1;
+    }
+
+    uint32_t started = 0;
+    for (; started < thread_count; started++) {
+        int err = pthread_create(&threads[started], NULL, index_build_worker_main, &job);
+        if (err != 0) {
+            fprintf(stderr, "pthread_create failed while building indexes: %s\n", strerror(err));
+            pthread_mutex_lock(&job.mutex);
+            job.error = 1;
+            pthread_mutex_unlock(&job.mutex);
+            break;
+        }
+    }
+    for (uint32_t i = 0; i < started; i++) {
+        pthread_join(threads[i], NULL);
+    }
+    free(threads);
+    pthread_mutex_destroy(&job.mutex);
+
+    if (job.error != 0) {
+        return 1;
+    }
+    store->count = count;
+    return 0;
+}
+
 static int trace_store_open_dir(const char *dir_path, TraceStore *store) {
     memset(store, 0, sizeof(*store));
     FileCandidate *candidates = NULL;
@@ -569,14 +714,14 @@ static int trace_store_open_dir(const char *dir_path, TraceStore *store) {
         return 1;
     }
     store->capacity = count;
+    store->count = count;
     for (uint32_t i = 0; i < count; i++) {
-        if (indexed_file_open(candidates[i].path, candidates[i].name, &store->files[i]) != 0) {
-            free_candidates(candidates, count);
-            trace_store_destroy(store);
-            return 1;
-        }
-        store->files[i].id = i + 1;
-        store->count++;
+        store->files[i].mapped.fd = -1;
+    }
+    if (trace_store_build_indexes_parallel(store, candidates, count) != 0) {
+        free_candidates(candidates, count);
+        trace_store_destroy(store);
+        return 1;
     }
     free_candidates(candidates, count);
     return 0;
@@ -830,12 +975,12 @@ static int collect_file_matches_forward(const IndexedFile *file,
     for (uint64_t line_no = from_line;
          line_no <= file->index.count && (*count - start_count) < limit;
          line_no++) {
-        if (use_bit_filter && !ascii_bits_may_contain(file->index.bits[line_no - 1], query_bits)) {
+        if (use_bit_filter && !ascii_bits_may_contain(line_index_bits(&file->index, line_no), query_bits)) {
             continue;
         }
         LineView effective = search_line_for_index(file, line_no);
         if (bmh_find(searcher, effective.start, effective.len) != NULL) {
-            size_t offset = file->index.offsets[line_no - 1];
+            size_t offset = line_index_offset(&file->index, line_no);
             if (!append_match(results, count, capacity, file->id, line_no, (uint64_t)offset)) {
                 return 1;
             }
@@ -864,10 +1009,10 @@ static int collect_file_matches_backward(const IndexedFile *file,
 
     uint64_t start_count = *count;
     while (line_no >= 1 && (*count - start_count) < limit) {
-        if (!use_bit_filter || ascii_bits_may_contain(file->index.bits[line_no - 1], query_bits)) {
+        if (!use_bit_filter || ascii_bits_may_contain(line_index_bits(&file->index, line_no), query_bits)) {
             LineView effective = search_line_for_index(file, line_no);
             if (bmh_find(searcher, effective.start, effective.len) != NULL) {
-                size_t offset = file->index.offsets[line_no - 1];
+                size_t offset = line_index_offset(&file->index, line_no);
                 if (!append_match(results, count, capacity, file->id, line_no, (uint64_t)offset)) {
                     return 1;
                 }
@@ -1181,7 +1326,7 @@ static int run_context(const IndexedFile *file,
     }
 
     for (uint64_t line_no = first_line; line_no <= last_line; line_no++) {
-        offset = file->index.offsets[line_no - 1];
+        offset = line_index_offset(&file->index, line_no);
         LineView line = line_at_offset(file->mapped.data, file->mapped.size, offset);
         emit_line("context", file->id, line_no, (uint64_t)offset, line_no == target_line, line);
     }

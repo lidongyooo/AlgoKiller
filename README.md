@@ -136,7 +136,7 @@ API_KEY=...
 | 工具 | 职责 |
 |------|------|
 | `trace_files` | 列出当前 trace 目录中已打开的 `.log` 文件编号、大小和行数；文件按大小降序编号，1 为最大 |
-| `trace_all_search` | 跨所有已打开 `.log` 文件搜索。只接受 `query` 与 `limit`；`limit` 是每个文件最多返回条数，只能是 `1-10`；返回的每条记录都包含来源 `file_id` |
+| `trace_all_search` | 跨所有已打开 `.log` 文件做存在性发现。只接受 `query` 与 `limit`；`limit` 是每个文件最多返回条数，只能是 `1-10`；返回的每条记录都包含来源 `file_id`；不要用返回行号先后判断最早生成点，需回到单个 `file_id` 内用 `mem_w` 或填充目标 buffer 的 call 边界证明生成位置 |
 | `trace_search` | 单文件大小写不敏感的精确子串搜索。必须指定数字 `file_id`，并二选一 `from_line`（向后）/ `before_line`（向前，最近优先）；`limit ≤ 100`。十六进制查询未命中时自动尝试 endian 反序与 leading-zero 修剪 |
 | `trace_context` | 按 `file_id` + 文件行号展开上下文，必须显式指定 `before` 与 `after`，各 `≤ 100` |
 | `ask_user` | 向用户提问。**调用先经过独立的 `AskUserReviewAgent` 审查**——若任务尚未完成、问题只是"是否继续"，验收 agent 会拒绝并要求主 agent 继续工作 |

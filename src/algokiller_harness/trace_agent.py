@@ -102,8 +102,8 @@ class TraceAgent:
 
             tool_calls = getattr(message, "tool_calls", None)
             if not tool_calls:
-                # if self._review_direct_assistant_text(assistant_text):
-                #     continue
+                if self._review_direct_assistant_text(assistant_text):
+                    continue
                 self._notify_final_text(assistant_text)
                 return assistant_text
 
