@@ -1,6 +1,6 @@
 # AlgoKiller
 
-面向 ARM64 执行 trace 的算法还原 harness。给定一段 GB 级 trace 日志和一个目标（密文、字段、调用链……），驱动 LLM 通过受约束的工具调用自主搜索证据、追踪数据流、还原算法，最终交付可执行 Python 代码或结构化分析报告。
+面向 ARM64 执行 trace 的算法还原 harness。给定一个包含 `.log` trace 的目录和一个目标（密文、字段、调用链……），驱动 LLM 通过受约束的工具调用自主搜索证据、追踪数据流、还原算法，最终交付可执行 Python 代码或结构化分析报告。
 
 **无视 trace 文件大小，一般 200K 上下文就能还原算法或完成特定任务。**
 
@@ -19,8 +19,8 @@ cd tools/search && make && cd ../..
 cp .env.example .env
 $EDITOR .env
 
-# 3. 跑起来
-python run_algokiller.py --trace-file ./my_trace.log --mode ciphertext
+# 3. 跑起来：传 trace 目录，目录内所有 .log 会被打开并编号
+python run_algokiller.py --trace-dir ./traces --mode ciphertext
 ```
 
 运行环境：Python 3.11+、可用的 C 编译器（`cc` / `gcc` / `clang`）。
@@ -43,7 +43,7 @@ python run_algokiller.py --trace-file ./my_trace.log --mode ciphertext
 ### 交互模式
 
 ```bash
-python run_algokiller.py --trace-file ./my_trace.log --mode ciphertext
+python run_algokiller.py --trace-dir ./traces --mode ciphertext
 ```
 
 进入 REPL（`ak >>`），支持 prompt-toolkit 历史记录、历史搜索（Ctrl-R）和多行粘贴。`q` / `quit` / `exit` 退出。
@@ -51,12 +51,14 @@ python run_algokiller.py --trace-file ./my_trace.log --mode ciphertext
 ### 一次性任务
 
 ```bash
-python run_algokiller.py --trace-file ./my_trace.log --mode ciphertext \
+python run_algokiller.py --trace-dir ./traces --mode ciphertext \
   "还原生成密文 a3b2c1... 的算法"
 
-python run_algokiller.py --trace-file ./my_trace.log --mode general \
+python run_algokiller.py --trace-dir ./traces --mode general \
   "说明 9999 行 x0 返回值是如何计算出来的"
 ```
+
+`--trace-dir` 是推荐入口；harness 会扫描该目录下所有 `.log` 文件，按大小降序分配 `file_id`。为了兼容旧调用，`--trace-file ./traces/a.log` 仍可用，但实际打开的是该文件所在目录。`--trace-dir` 与 `--trace-file` 不能同时传。
 
 ### 恢复会话
 
@@ -66,7 +68,7 @@ python run_algokiller.py --trace-file ./my_trace.log --mode general \
 python run_algokiller.py --resume-session sessions/20260509_213015.json
 ```
 
-恢复时会沿用快照里的 `--trace-file` 和 `--mode`，不允许覆盖。加 `-i` 可恢复后进入 REPL 而非自动 `continue`。
+恢复时会沿用快照里的 `--trace-dir`/`--trace-file` 和 `--mode`，不允许覆盖。加 `-i` 可恢复后进入 REPL 而非自动 `continue`。
 
 ---
 
@@ -129,12 +131,14 @@ API_KEY=...
 
 算法还原是深度优先的推理过程——追踪一个寄存器值的来源可能需要 10 轮连续搜索。多 agent 切换会丢失推理链条；单 agent 的连续上下文天然适合这种深度追踪。
 
-### 最小工具集（4 个）
+### 最小工具集
 
 | 工具 | 职责 |
 |------|------|
-| `trace_search` | 大小写不敏感的精确子串搜索。必须二选一 `from_line`（向后）/ `before_line`（向前，最近优先）；`limit ≤ 100`。十六进制查询未命中时自动尝试 endian 反序与 leading-zero 修剪 |
-| `trace_context` | 按文件行号展开上下文，必须显式指定 `before` 与 `after`，各 `≤ 100` |
+| `trace_files` | 列出当前 trace 目录中已打开的 `.log` 文件编号、大小和行数；文件按大小降序编号，1 为最大 |
+| `trace_all_search` | 跨所有已打开 `.log` 文件搜索。只接受 `query` 与 `limit`；`limit` 是每个文件最多返回条数，只能是 `1-10`；返回的每条记录都包含来源 `file_id` |
+| `trace_search` | 单文件大小写不敏感的精确子串搜索。必须指定数字 `file_id`，并二选一 `from_line`（向后）/ `before_line`（向前，最近优先）；`limit ≤ 100`。十六进制查询未命中时自动尝试 endian 反序与 leading-zero 修剪 |
+| `trace_context` | 按 `file_id` + 文件行号展开上下文，必须显式指定 `before` 与 `after`，各 `≤ 100` |
 | `ask_user` | 向用户提问。**调用先经过独立的 `AskUserReviewAgent` 审查**——若任务尚未完成、问题只是"是否继续"，验收 agent 会拒绝并要求主 agent 继续工作 |
 | `write_recovered_source` | 写出最终 Python 还原源码到 `artifacts/`。harness 自动在文件名后追加 `_<MODE>_<timestamp>` |
 
@@ -161,11 +165,12 @@ API_KEY=...
 
 ### Native 搜索后端
 
-`tools/search/ak_search`（C，~960 行）是核心性能基石：
+`tools/search/ak_search` 是核心性能基石：
 
-- mmap 整个 trace，单次构建行偏移索引；
+- daemon 启动时打开 trace 目录下所有 `.log` 文件，按大小降序分配 `file_id`；
+- 每个文件 mmap 后构建行偏移索引与 128-bit ASCII bitmap 行索引；
 - ASCII 大小写不敏感的 BMH 搜索，不材料化 lowercase 副本；
-- **daemon 模式**：harness 启动时拉起一个常驻 `ak_search daemon`，所有 `trace_search` / `trace_context` 调用复用同一份内存映射与索引，不重复 IO。
+- `trace_all_search` 跨文件搜索使用常驻线程池；单文件搜索和 `trace_context` 不做线程内并行。
 
 GB 级 trace 上 trace_search 的延迟通常在百毫秒量级。
 
@@ -192,7 +197,7 @@ sessions/
 
 ## Trace 格式
 
-接受 [GumTrace](https://github.com/lidongyooo/GumTrace) 生成的 ARM64 执行 trace。harness 强依赖以下行格式：
+接受 [GumTrace](https://github.com/lidongyooo/GumTrace) 生成的 ARM64 执行 trace。推荐把同一轮分析相关的 `.log` 放在同一目录下，并用 `--trace-dir` 启动。harness 强依赖以下行格式：
 
 ```
 [module] 0xABS!0xREL  mnemonic operands ; observed_inputs -> observed_outputs
@@ -205,14 +210,14 @@ ret: value
 - 指令行以 `[` 开头；`;` 后是寄存器/内存观测（`x0=...`、`mem_r=...`、`mem_w=...`、`-> x8=...`），都是当前执行的真实值
 - `call func:` / `ret:` 是外部调用摘要，按时间顺序夹在指令流中
 - hexdump 出现在 `call`/`ret` 之间，每行 16 字节，按内存地址递增；右侧 `|...|` 是 ASCII 预览（不可打印为点），严格还原以左侧 hex 为准
-- **文件行号是跨工具对齐的稳定锚点**——所有结论必须能锚定到具体行号
+- **`file_id` + 文件行号是跨工具对齐的稳定锚点**——所有结论必须能锚定到具体来源文件编号和行号
 
 ---
 
 ## 项目结构
 
 ```
-run_algokiller.py                 入口脚本（注入默认 trace-file / mode 后转交 cli.main）
+run_algokiller.py                 入口脚本（注入默认 trace-dir / mode 后转交 cli.main）
 pyproject.toml                    包元数据，console script: algokiller
 .env.example                      配置模板
 
@@ -221,11 +226,11 @@ src/algokiller_harness/
 ├── config.py                     .env 加载，HarnessConfig dataclass
 ├── prompts.py                    系统提示词（base + ciphertext + general）
 ├── agent_prompts.py              ask_user 验收 agent 与 note 压缩 agent 的提示词
-├── tool_schemas.py               4 个工具的 JSON Schema
+├── tool_schemas.py               本地工具的 JSON Schema
 ├── tool_protocol.py              ToolExecutor 接口
 ├── trace_agent.py                核心 agent loop、系统提示词重注入、压缩触发
 ├── routing_executor.py           工具调用按名称分发到具体 executor
-├── trace_executor.py             trace_search / trace_context（调用 ak_search daemon）
+├── trace_executor.py             trace_files / trace_all_search / trace_search / trace_context（调用 ak_search daemon）
 ├── artifact_executor.py          write_recovered_source + 最终 markdown 落盘
 ├── user_executor.py              ask_user 的实际终端交互
 ├── ask_user_reviewer.py          ask_user 验收 agent

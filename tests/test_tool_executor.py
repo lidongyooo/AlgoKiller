@@ -7,7 +7,9 @@ from algokiller_harness.note_store import NoteStore
 from algokiller_harness.tool_schemas import (
     ASK_USER_TOOL,
     RECOVERED_SOURCE_TOOL,
+    TRACE_ALL_SEARCH_TOOL,
     TRACE_CONTEXT_TOOL,
+    TRACE_FILES_TOOL,
     TRACE_SEARCH_TOOL,
 )
 from algokiller_harness.trace_executor import LocalTraceToolExecutor
@@ -15,6 +17,8 @@ from algokiller_harness.trace_executor import LocalTraceToolExecutor
 
 def test_builtin_tools_are_litellm_function_tools():
     tools = [
+        TRACE_FILES_TOOL,
+        TRACE_ALL_SEARCH_TOOL,
         TRACE_SEARCH_TOOL,
         TRACE_CONTEXT_TOOL,
         ASK_USER_TOOL,
@@ -23,21 +27,28 @@ def test_builtin_tools_are_litellm_function_tools():
 
     assert all(tool["type"] == "function" for tool in tools)
     assert [tool["function"]["name"] for tool in tools] == [
+        "trace_files",
+        "trace_all_search",
         "trace_search",
         "trace_context",
         "ask_user",
         "write_recovered_source",
     ]
-    assert "file" not in TRACE_SEARCH_TOOL["function"]["parameters"]["properties"]
-    assert "file" not in TRACE_CONTEXT_TOOL["function"]["parameters"]["properties"]
+    assert "file_id" in TRACE_SEARCH_TOOL["function"]["parameters"]["required"]
+    assert "file_id" in TRACE_CONTEXT_TOOL["function"]["parameters"]["required"]
     assert "from_line" not in TRACE_SEARCH_TOOL["function"]["parameters"]["required"]
     assert "before_line" not in TRACE_SEARCH_TOOL["function"]["parameters"]["required"]
     assert "limit" in TRACE_SEARCH_TOOL["function"]["parameters"]["required"]
     assert TRACE_SEARCH_TOOL["function"]["parameters"]["properties"]["from_line"]["minimum"] == 1
     assert TRACE_SEARCH_TOOL["function"]["parameters"]["properties"]["before_line"]["minimum"] == 1
     assert TRACE_SEARCH_TOOL["function"]["parameters"]["properties"]["limit"]["maximum"] == 100
+    assert TRACE_SEARCH_TOOL["function"]["parameters"]["properties"]["file_id"]["type"] == "integer"
+    assert TRACE_ALL_SEARCH_TOOL["function"]["parameters"]["required"] == ["query", "limit"]
+    assert TRACE_ALL_SEARCH_TOOL["function"]["parameters"]["properties"]["limit"]["minimum"] == 1
+    assert TRACE_ALL_SEARCH_TOOL["function"]["parameters"]["properties"]["limit"]["maximum"] == 10
+    assert "per file" in TRACE_ALL_SEARCH_TOOL["function"]["description"]
     assert "context" not in TRACE_CONTEXT_TOOL["function"]["parameters"]["properties"]
-    assert TRACE_CONTEXT_TOOL["function"]["parameters"]["required"] == ["line", "before", "after"]
+    assert TRACE_CONTEXT_TOOL["function"]["parameters"]["required"] == ["file_id", "line", "before", "after"]
     assert TRACE_CONTEXT_TOOL["function"]["parameters"]["properties"]["before"]["maximum"] == 100
     assert TRACE_CONTEXT_TOOL["function"]["parameters"]["properties"]["after"]["maximum"] == 100
     assert "Choose a search purpose before each call" in TRACE_SEARCH_TOOL["function"]["description"]
@@ -54,11 +65,14 @@ def test_trace_executor_requires_one_search_anchor_and_bounds_limit(tmp_path):
     executor = LocalTraceToolExecutor(tmp_path, trace_file)
     executor._ensure_search_bin = lambda: None
 
-    missing_anchor = executor.execute("trace_search", {"query": "hello", "limit": 10})
-    both_anchors = executor.execute("trace_search", {"query": "hello", "from_line": 1, "before_line": 2, "limit": 10})
-    missing_limit = executor.execute("trace_search", {"query": "hello", "from_line": 1})
-    too_large = executor.execute("trace_search", {"query": "hello", "from_line": 1, "limit": 101})
+    missing_file = executor.execute("trace_search", {"query": "hello", "from_line": 1, "limit": 10})
+    missing_anchor = executor.execute("trace_search", {"file_id": 1, "query": "hello", "limit": 10})
+    both_anchors = executor.execute("trace_search", {"file_id": 1, "query": "hello", "from_line": 1, "before_line": 2, "limit": 10})
+    missing_limit = executor.execute("trace_search", {"file_id": 1, "query": "hello", "from_line": 1})
+    too_large = executor.execute("trace_search", {"file_id": 1, "query": "hello", "from_line": 1, "limit": 101})
 
+    assert '"status": "error"' in missing_file
+    assert "file_id is required" in missing_file
     assert '"status": "error"' in missing_anchor
     assert "exactly one of from_line or before_line is required" in missing_anchor
     assert '"status": "error"' in both_anchors
@@ -81,10 +95,31 @@ def test_trace_executor_before_line_uses_backward_daemon_command(tmp_path):
 
     executor._daemon_request = fake_daemon_request
 
-    result = executor.execute("trace_search", {"query": "hello", "before_line": 42, "limit": 2})
+    result = executor.execute("trace_search", {"file_id": 7, "query": "hello", "before_line": 42, "limit": 2})
 
     assert '"status": "ok"' in result
-    assert calls == [("match\t0\t42\t2\t68656c6c6f", 30000)]
+    assert calls == [("match\t7\t0\t42\t2\t68656c6c6f", 30000)]
+
+
+def test_trace_executor_trace_all_search_uses_dedicated_daemon_command_and_bounds_limit(tmp_path):
+    trace_file = tmp_path / "trace.log"
+    trace_file.write_text("hello\n", encoding="utf-8")
+    executor = LocalTraceToolExecutor(tmp_path, trace_file)
+    calls = []
+
+    def fake_daemon_request(command, *, max_output_chars):
+        calls.append((command, max_output_chars))
+        return json.dumps({"status": "ok", "returncode": 0, "stdout": "", "stderr": "", "truncated": False})
+
+    executor._daemon_request = fake_daemon_request
+
+    ok = executor.execute("trace_all_search", {"query": "hello", "limit": 2})
+    too_large = executor.execute("trace_all_search", {"query": "hello", "limit": 11})
+
+    assert '"status": "ok"' in ok
+    assert calls == [("trace_all_search\t2\t68656c6c6f", 30000)]
+    assert '"status": "error"' in too_large
+    assert "limit must be <= 10" in too_large
 
 
 def test_trace_executor_hex_search_retries_byte_reversed_when_empty(tmp_path):
@@ -101,14 +136,14 @@ def test_trace_executor_hex_search_retries_byte_reversed_when_empty(tmp_path):
 
     executor._daemon_request = fake_daemon_request
 
-    result = json.loads(executor.execute("trace_search", {"query": "0x11223344", "from_line": 1, "limit": 5}))
+    result = json.loads(executor.execute("trace_search", {"file_id": 1, "query": "0x11223344", "from_line": 1, "limit": 5}))
 
     assert result["status"] == "ok"
     assert result["stdout"] == '{"type":"match","line":1,"byte_offset":0,"text":"value=0x44332211"}\n'
     assert "fallback_query" not in result
     assert len(calls) == 2
-    assert calls[0] == ("match\t1\t0\t5\t30783131323233333434", 30000)
-    assert calls[1] == ("match\t1\t0\t5\t30783434333332323131", 30000)
+    assert calls[0] == ("match\t1\t1\t0\t5\t30783131323233333434", 30000)
+    assert calls[1] == ("match\t1\t1\t0\t5\t30783434333332323131", 30000)
 
 
 def test_trace_executor_hex_search_trims_leading_zero_after_reverse_misses(tmp_path):
@@ -125,7 +160,7 @@ def test_trace_executor_hex_search_trims_leading_zero_after_reverse_misses(tmp_p
 
     executor._daemon_request = fake_daemon_request
 
-    result = json.loads(executor.execute("trace_search", {"query": "0x001123", "before_line": 50, "limit": 3}))
+    result = json.loads(executor.execute("trace_search", {"file_id": 1, "query": "0x001123", "before_line": 50, "limit": 3}))
 
     assert result["status"] == "ok"
     assert result["stdout"] == '{"type":"match","line":1,"byte_offset":0,"text":"value=0x1123"}\n'
@@ -147,7 +182,7 @@ def test_trace_executor_hex_search_reverses_trimmed_leading_zero_value(tmp_path)
 
     executor._daemon_request = fake_daemon_request
 
-    result = json.loads(executor.execute("trace_search", {"query": "0x001122", "from_line": 1, "limit": 3}))
+    result = json.loads(executor.execute("trace_search", {"file_id": 1, "query": "0x001122", "from_line": 1, "limit": 3}))
 
     assert result["status"] == "ok"
     assert result["stdout"] == '{"type":"match","line":1,"byte_offset":0,"text":"value=0x2211"}\n'
@@ -161,12 +196,15 @@ def test_trace_executor_requires_and_bounds_context_counts(tmp_path):
     executor = LocalTraceToolExecutor(tmp_path, trace_file)
     executor._ensure_search_bin = lambda: None
 
-    missing_before = executor.execute("trace_context", {"line": 1, "after": 1})
-    missing_after = executor.execute("trace_context", {"line": 1, "before": 1})
-    context_arg = executor.execute("trace_context", {"line": 1, "context": 1})
-    before_too_large = executor.execute("trace_context", {"line": 1, "before": 101, "after": 1})
-    after_too_large = executor.execute("trace_context", {"line": 1, "before": 1, "after": 101})
+    missing_file = executor.execute("trace_context", {"line": 1, "before": 1, "after": 1})
+    missing_before = executor.execute("trace_context", {"file_id": 1, "line": 1, "after": 1})
+    missing_after = executor.execute("trace_context", {"file_id": 1, "line": 1, "before": 1})
+    context_arg = executor.execute("trace_context", {"file_id": 1, "line": 1, "context": 1})
+    before_too_large = executor.execute("trace_context", {"file_id": 1, "line": 1, "before": 101, "after": 1})
+    after_too_large = executor.execute("trace_context", {"file_id": 1, "line": 1, "before": 1, "after": 101})
 
+    assert '"status": "error"' in missing_file
+    assert "file_id is required" in missing_file
     assert '"status": "error"' in missing_before
     assert "before is required" in missing_before
     assert '"status": "error"' in missing_after

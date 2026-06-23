@@ -19,7 +19,7 @@ class RoutingToolExecutor:
         self.user_executor = user_executor
 
     def execute(self, name: str, arguments: dict[str, Any]) -> str:
-        if name in {"trace_search", "trace_context"}:
+        if name in {"trace_files", "trace_all_search", "trace_search", "trace_context"}:
             return self.trace_executor.execute(name, arguments)
         if name == "write_recovered_source":
             return self.artifact_executor.execute(name, arguments)

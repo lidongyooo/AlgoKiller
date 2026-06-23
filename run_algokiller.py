@@ -24,8 +24,17 @@ _disable_import_cache()
 from algokiller_harness.cli import main  # noqa: E402
 
 
-DEFAULT_TRACE_FILE = "/Users/lidongyooo/custom/tiktok/traces/trace_1009_main.log"
+DEFAULT_TRACE_DIR = "/Users/lidongyooo/custom/tiktok/traces"
 DEFAULT_MODE = "ciphertext"
+
+
+def _has_trace_path_arg(args: list[str]) -> bool:
+    return any(
+        arg in {"--trace-dir", "--trace-file"}
+        or arg.startswith("--trace-dir=")
+        or arg.startswith("--trace-file=")
+        for arg in args
+    )
 
 
 def _default_args() -> list[str]:
@@ -33,8 +42,8 @@ def _default_args() -> list[str]:
     if any(arg == "--resume-session" or arg.startswith("--resume-session=") for arg in args):
         return []
     defaults = []
-    if not any(arg == "--trace-file" or arg.startswith("--trace-file=") for arg in args):
-        defaults.extend(["--trace-file", DEFAULT_TRACE_FILE])
+    if not _has_trace_path_arg(args):
+        defaults.extend(["--trace-dir", DEFAULT_TRACE_DIR])
     if not any(arg == "--mode" or arg.startswith("--mode=") for arg in args):
         defaults.extend(["--mode", DEFAULT_MODE])
     if not args:

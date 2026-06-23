@@ -25,6 +25,7 @@ def _config(trace_file):
         api_key="secret-key",
         api_base="https://example.test/v1",
         trace_file=trace_file,
+        trace_dir=trace_file.parent,
         mode="ciphertext",
         artifacts_dir=trace_file.parent / "artifacts",
         max_tokens=99999,
@@ -54,6 +55,7 @@ def test_session_snapshot_round_trips_context_without_api_key(tmp_path, monkeypa
         prompt=["recover", "this"],
         interactive=False,
         trace_file=str(trace_file),
+        trace_dir=None,
         mode="ciphertext",
         resume_session=None,
     )
@@ -81,7 +83,7 @@ def test_session_snapshot_round_trips_context_without_api_key(tmp_path, monkeypa
 def test_resume_args_are_loaded_from_session(tmp_path):
     trace_file = tmp_path / "sample.trace"
     trace_file.write_text("", encoding="utf-8")
-    args = Namespace(trace_file=None, mode=None)
+    args = Namespace(trace_file=None, trace_dir=None, mode=None)
 
     _apply_resume_session_args(
         args,
@@ -92,15 +94,78 @@ def test_resume_args_are_loaded_from_session(tmp_path):
     assert args.mode == "general"
 
 
+def test_resume_args_prefer_trace_dir_from_session(tmp_path):
+    trace_dir = tmp_path / "traces"
+    trace_dir.mkdir()
+    args = Namespace(trace_file=None, trace_dir=None, mode=None)
+
+    _apply_resume_session_args(
+        args,
+        {"startup": {"trace_dir": str(trace_dir), "mode": "general"}},
+    )
+
+    assert args.trace_file is None
+    assert args.trace_dir == str(trace_dir)
+    assert args.mode == "general"
+
+
 def test_resume_args_reject_conflicting_trace_file(tmp_path):
     trace_file = tmp_path / "sample.trace"
-    other_trace_file = tmp_path / "other.trace"
+    other_trace_dir = tmp_path / "other"
+    other_trace_dir.mkdir()
+    other_trace_file = other_trace_dir / "other.trace"
     trace_file.write_text("", encoding="utf-8")
     other_trace_file.write_text("", encoding="utf-8")
-    args = Namespace(trace_file=str(other_trace_file), mode=None)
+    args = Namespace(trace_file=str(other_trace_file), trace_dir=None, mode=None)
 
     with pytest.raises(ValueError, match="different --trace-file"):
         _apply_resume_session_args(
             args,
             {"startup": {"trace_file": str(trace_file), "mode": "ciphertext"}},
+        )
+
+
+def test_resume_args_allow_different_legacy_file_in_same_trace_dir(tmp_path):
+    trace_file = tmp_path / "sample.trace"
+    other_trace_file = tmp_path / "other.trace"
+    trace_file.write_text("", encoding="utf-8")
+    other_trace_file.write_text("", encoding="utf-8")
+    args = Namespace(trace_file=str(other_trace_file), trace_dir=None, mode=None)
+
+    _apply_resume_session_args(
+        args,
+        {"startup": {"trace_file": str(trace_file), "mode": "ciphertext"}},
+    )
+
+    assert args.trace_file == str(trace_file)
+    assert args.trace_dir is None
+    assert args.mode == "ciphertext"
+
+
+def test_resume_args_allow_trace_dir_matching_legacy_trace_file_scope(tmp_path):
+    trace_file = tmp_path / "sample.trace"
+    trace_file.write_text("", encoding="utf-8")
+    args = Namespace(trace_file=None, trace_dir=str(tmp_path), mode=None)
+
+    _apply_resume_session_args(
+        args,
+        {"startup": {"trace_file": str(trace_file), "mode": "ciphertext"}},
+    )
+
+    assert args.trace_file == str(trace_file)
+    assert args.trace_dir is None
+    assert args.mode == "ciphertext"
+
+
+def test_resume_args_reject_conflicting_trace_dir(tmp_path):
+    trace_dir = tmp_path / "traces"
+    other_trace_dir = tmp_path / "other_traces"
+    trace_dir.mkdir()
+    other_trace_dir.mkdir()
+    args = Namespace(trace_file=None, trace_dir=str(other_trace_dir), mode=None)
+
+    with pytest.raises(ValueError, match="different --trace-dir"):
+        _apply_resume_session_args(
+            args,
+            {"startup": {"trace_dir": str(trace_dir), "mode": "ciphertext"}},
         )

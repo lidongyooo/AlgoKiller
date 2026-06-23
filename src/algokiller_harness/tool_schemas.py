@@ -73,11 +73,12 @@ TRACE_SEARCH_TOOL = {
     "function": {
         "name": "trace_search",
         "description": (
-            "Case-insensitive exact substring search over the session trace file. "
+            "Case-insensitive exact substring search over indexed session trace files. "
             "Use this first to locate functions, registers, addresses, constants, call summaries, "
-            "and hexdump ASCII text in very large traces. Every call must include exactly one "
+            "and hexdump ASCII text in very large traces. Every call must include file_id and exactly one "
             "of from_line or before_line, plus limit. before_line searches backward and returns "
-            "nearest earlier matches first. Choose a search purpose before each call. For byte/hex "
+            "nearest earlier matches first. file_id must be an integer file number from trace_files. "
+            "Use trace_all_search for cross-file discovery. Choose a search purpose before each call. For byte/hex "
             "data starting with 0x, if the original query has no matches the harness automatically "
             "tries byte-reversed endian order; if that misses and the hex value has leading zeroes, "
             "it then tries the leading-zero-trimmed value and the byte-reversed trimmed value. "
@@ -88,6 +89,11 @@ TRACE_SEARCH_TOOL = {
         "parameters": {
             "type": "object",
             "properties": {
+                "file_id": {
+                    "type": "integer",
+                    "description": "Required trace file number from trace_files.",
+                    "minimum": 1,
+                },
                 "query": {
                     "type": "string",
                     "description": "Exact substring to find. Matching is case-insensitive for ASCII.",
@@ -112,6 +118,36 @@ TRACE_SEARCH_TOOL = {
                     "maximum": 100,
                 },
             },
+            "required": ["file_id", "query", "limit"],
+        },
+    },
+}
+
+
+TRACE_ALL_SEARCH_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "trace_all_search",
+        "description": (
+            "Forward case-insensitive exact substring search across every opened .log trace file. "
+            "Only use this for cross-file discovery when the relevant file is unknown. Every returned "
+            "match includes its source file_id. limit is the maximum number of records to return per file "
+            "and must be between 1 and 10."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Exact substring to find in every opened file. Matching is case-insensitive for ASCII.",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Required per-file maximum number of matching lines to return. Must be between 1 and 10.",
+                    "minimum": 1,
+                    "maximum": 10,
+                },
+            },
             "required": ["query", "limit"],
         },
     },
@@ -123,14 +159,19 @@ TRACE_CONTEXT_TOOL = {
     "function": {
         "name": "trace_context",
         "description": (
-            "Return neighboring trace text lines around a 1-based file line in the session trace. "
+            "Return neighboring trace text lines around a 1-based line in a numbered session trace file. "
             "Use this after trace_search to inspect instruction, call, ret, and hexdump context. "
-            "Every call must include explicit before and after line counts; each line-count "
+            "Every call must include file_id plus explicit before and after line counts; each line-count "
             "argument must be no greater than 100."
         ),
         "parameters": {
             "type": "object",
             "properties": {
+                "file_id": {
+                    "type": "integer",
+                    "description": "Required trace file number from trace_files.",
+                    "minimum": 1,
+                },
                 "line": {
                     "type": "integer",
                     "description": "1-based target file line.",
@@ -148,7 +189,24 @@ TRACE_CONTEXT_TOOL = {
                     "maximum": 100,
                 },
             },
-            "required": ["line", "before", "after"],
+            "required": ["file_id", "line", "before", "after"],
+        },
+    },
+}
+
+
+TRACE_FILES_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "trace_files",
+        "description": (
+            "List opened .log trace files with their numeric file_id, size in MB, and line count. "
+            "Use this before trace_search/trace_context when file numbering is unknown."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {},
+            "required": [],
         },
     },
 }

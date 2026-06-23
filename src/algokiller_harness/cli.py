@@ -18,13 +18,16 @@ from .session_store import (
     restore_loop_count,
     restore_messages,
     restore_mode,
+    restore_trace_dir,
     restore_trace_file,
     save_session,
 )
 from .tool_schemas import (
     ASK_USER_TOOL,
     RECOVERED_SOURCE_TOOL,
+    TRACE_ALL_SEARCH_TOOL,
     TRACE_CONTEXT_TOOL,
+    TRACE_FILES_TOOL,
     TRACE_SEARCH_TOOL,
 )
 from .trace_agent import TraceAgent
@@ -147,6 +150,8 @@ def _build_agent_from_config(config: HarnessConfig) -> TraceAgent:
     agent = TraceAgent(
         model=config.model,
         tools=[
+            TRACE_FILES_TOOL,
+            TRACE_ALL_SEARCH_TOOL,
             TRACE_SEARCH_TOOL,
             TRACE_CONTEXT_TOOL,
             ASK_USER_TOOL,
@@ -186,9 +191,10 @@ def _build_agent_from_config(config: HarnessConfig) -> TraceAgent:
     bound_context_message = {
         "role": "system",
         "content": (
-            f"Session trace file is already bound by the harness: {config.trace_file}. "
+            f"Session trace directory is already bound by the harness: {config.trace_dir}. "
+            f"Startup trace path: {config.trace_file}. "
             f"Analysis mode is fixed at startup: {config.mode}. "
-            "Do not ask tool calls to provide a trace file path or change analysis mode."
+            "Do not ask tool calls to provide a trace path or change analysis mode."
         ),
     }
     agent.messages.append(bound_context_message)
@@ -274,12 +280,19 @@ def _bind_session_writer(
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Single-agent arm64 trace analysis harness.")
+    parser = argparse.ArgumentParser(description="Single-agent arm64 trace directory analysis harness.")
     parser.add_argument("prompt", nargs="*", help="One-shot task prompt.")
     parser.add_argument("-i", "--interactive", action="store_true", help="Start an interactive session.")
     parser.add_argument(
         "--trace-file",
-        help="Trace log file for this conversation. Tools use this session trace automatically.",
+        help=(
+            "Trace log file for this conversation. Deprecated for multi-file traces: "
+            "the harness opens this file's parent directory and indexes every .log file there."
+        ),
+    )
+    parser.add_argument(
+        "--trace-dir",
+        help="Trace directory for this conversation. The harness indexes every .log file in this directory.",
     )
     parser.add_argument(
         "--mode",
@@ -296,20 +309,34 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _effective_trace_scope(path_text: str) -> Path:
+    path = Path(path_text).expanduser().resolve()
+    return path if path.is_dir() else path.parent
+
+
 def _apply_resume_session_args(args: argparse.Namespace, session_data: dict[str, object]) -> None:
     trace_file = restore_trace_file(session_data)
+    trace_dir = restore_trace_dir(session_data)
     mode = restore_mode(session_data)
-    if not trace_file:
-        raise ValueError("Session file does not contain a trace_file.")
+    if not trace_file and not trace_dir:
+        raise ValueError("Session file does not contain a trace_file or trace_dir.")
     if not mode:
         raise ValueError("Session file does not contain a mode.")
-    if args.trace_file and str(Path(args.trace_file).expanduser().resolve()) != str(
-        Path(trace_file).expanduser().resolve()
-    ):
+    saved_trace_path = trace_dir or trace_file
+    assert saved_trace_path is not None
+    saved_scope = _effective_trace_scope(saved_trace_path)
+    if args.trace_file and _effective_trace_scope(args.trace_file) != saved_scope:
         raise ValueError("Do not combine --resume-session with a different --trace-file.")
+    if getattr(args, "trace_dir", None) and _effective_trace_scope(args.trace_dir) != saved_scope:
+        raise ValueError("Do not combine --resume-session with a different --trace-dir.")
     if args.mode and args.mode != mode:
         raise ValueError("Do not combine --resume-session with a different --mode.")
-    args.trace_file = trace_file
+    if trace_dir:
+        args.trace_dir = trace_dir
+        args.trace_file = None
+    else:
+        args.trace_file = trace_file
+        args.trace_dir = None
     args.mode = mode
 
 
@@ -322,7 +349,7 @@ def main() -> int:
         if args.resume_session:
             session_data = load_session(args.resume_session)
             _apply_resume_session_args(args, session_data)
-        config = load_config(trace_file=args.trace_file, mode=args.mode)
+        config = load_config(trace_file=args.trace_file, trace_dir=args.trace_dir, mode=args.mode)
         agent = _build_agent_from_config(config)
         if session_data is not None:
             restored_messages = restore_messages(session_data)
@@ -355,7 +382,7 @@ def main() -> int:
                 return 1
         elif args.interactive or not args.prompt:
             print(
-                f"AlgoKiller harness. Trace file loaded. Mode={args.mode}. "
+                f"AlgoKiller harness. Trace directory loaded. Mode={args.mode}. "
                 "Type 'q', 'quit', or 'exit' to stop."
             )
             try:

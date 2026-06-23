@@ -16,6 +16,7 @@ class HarnessConfig:
     api_key: str
     api_base: str
     trace_file: Path
+    trace_dir: Path
     mode: str
     artifacts_dir: Path
     max_tokens: int
@@ -39,18 +40,30 @@ PROVIDER_ALIASES = {
 }
 
 
-def _require_trace_file(path_text: str | None) -> Path:
-    if not path_text:
-        raise ValueError("Missing trace file. Start with --trace-file /path/to/trace.log.")
+def _resolve_existing_path(path_text: str, *, label: str) -> Path:
     path = Path(path_text).expanduser()
     if not path.is_absolute():
         path = Path.cwd() / path
     path = path.resolve()
     if not path.exists():
-        raise ValueError(f"Trace file does not exist: {path}")
-    if not path.is_file():
-        raise ValueError(f"Trace path is not a file: {path}")
+        raise ValueError(f"{label} does not exist: {path}")
     return path
+
+
+def _require_trace_path(*, trace_file: str | None, trace_dir: str | None) -> tuple[Path, Path]:
+    if trace_file and trace_dir:
+        raise ValueError("Do not combine --trace-file and --trace-dir.")
+    path_text = trace_dir or trace_file
+    if not path_text:
+        raise ValueError("Missing trace path. Start with --trace-dir /path/to/traces or --trace-file /path/to/trace.log.")
+    path = _resolve_existing_path(path_text, label="Trace path")
+    if trace_dir:
+        if not path.is_dir():
+            raise ValueError(f"Trace directory path is not a directory: {path}")
+        return path, path
+    if not path.is_file():
+        raise ValueError(f"Trace file path is not a file: {path}")
+    return path, path.parent
 
 
 def _require_mode(mode: str | None) -> str:
@@ -127,10 +140,16 @@ def _load_environment() -> Path | None:
     return None
 
 
-def load_config(*, trace_file: str | None = None, mode: str | None = None) -> HarnessConfig:
+def load_config(
+    *,
+    trace_file: str | None = None,
+    trace_dir: str | None = None,
+    mode: str | None = None,
+) -> HarnessConfig:
     env_file = _load_environment()
     provider, model_name, model = _load_model_settings()
     api_key, api_base = _load_api_settings()
+    trace_path, trace_directory = _require_trace_path(trace_file=trace_file, trace_dir=trace_dir)
     return HarnessConfig(
         env_file=env_file,
         provider=provider,
@@ -138,7 +157,8 @@ def load_config(*, trace_file: str | None = None, mode: str | None = None) -> Ha
         model=model,
         api_key=api_key,
         api_base=api_base,
-        trace_file=_require_trace_file(trace_file),
+        trace_file=trace_path,
+        trace_dir=trace_directory,
         mode=_require_mode(mode),
         artifacts_dir=Path(os.getenv("HARNESS_ARTIFACTS_DIR", "artifacts")),
         max_tokens=int(os.getenv("HARNESS_MAX_TOKENS", "99999")),

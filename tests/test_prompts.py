@@ -31,7 +31,8 @@ def test_ciphertext_prompt_contains_mode_goal():
     assert "每次调用 trace_search 必须显式携带 limit" in prompt
     assert "from_line 与 before_line 中选择一个" in prompt
     assert "before_line 只搜索该行之前的内容并按最近命中优先返回" in prompt
-    assert "所有条数参数最大值都是 100" in prompt
+    assert "trace_all_search 只接受 query 和 limit" in prompt
+    assert "trace_search 和 trace_context 的条数参数最大值都是 100" in prompt
     assert "搜索 hex/字节数据时必须按字节处理" in prompt
     assert "当某次字节数据原序搜索未命中时，必须尝试 endian 反序再搜索一次" in prompt
     assert "如果待搜索字节超过 4 字节" in prompt

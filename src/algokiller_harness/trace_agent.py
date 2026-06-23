@@ -259,8 +259,8 @@ class TraceAgent:
                     status="skipped_unknown_tool",
                     error=f"Unknown tool: {name}",
                     instruction=(
-                        "该工具不存在，已跳过。不要停止，也不要询问用户；请只使用 trace_search、"
-                        "trace_context、ask_user、write_recovered_source 重新推进上一轮任务。"
+                        "该工具不存在，已跳过。不要停止，也不要询问用户；请只使用 trace_files、"
+                        "trace_all_search、trace_search、trace_context、ask_user、write_recovered_source 重新推进上一轮任务。"
                     ),
                 ),
             )
@@ -318,8 +318,8 @@ class TraceAgent:
                         "reason": review["reason"],
                         "instruction": review["instruction"]
                         or (
-                            "用户任务尚未完成。不要直接询问用户是否继续；继续使用 trace_search、trace_context "
-                            "和必要的 artifact 工具推进分析。"
+                            "用户任务尚未完成。不要直接询问用户是否继续；继续使用 trace_files、trace_all_search、"
+                            "trace_search、trace_context 和必要的 artifact 工具推进分析。"
                         ),
                     },
                     ensure_ascii=False,

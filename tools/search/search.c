@@ -1,3 +1,4 @@
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
@@ -5,7 +6,6 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
-#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -47,42 +47,50 @@ typedef struct {
     uint64_t capacity;
 } LineIndex;
 
-typedef struct SearchThreadPool SearchThreadPool;
-
 typedef struct {
+    uint32_t id;
+    char *path;
+    char *name;
     MappedFile mapped;
     LineIndex index;
-    SearchThreadPool *search_pool;
 } IndexedFile;
 
 typedef struct {
+    IndexedFile *files;
+    uint32_t count;
+    uint32_t capacity;
+} TraceStore;
+
+typedef struct {
+    uint32_t file_id;
     uint64_t line_no;
     uint64_t byte_offset;
 } MatchResult;
 
-typedef struct {
-    const IndexedFile *indexed;
-    const BmhSearcher *searcher;
-    AsciiBits query_bits;
-    atomic_uint_fast64_t cutoff_line;
-    bool use_bit_filter;
-    uint64_t limit;
-    bool backward;
-} SearchJob;
+typedef struct MultiFileThreadPool MultiFileThreadPool;
 
 typedef struct {
     pthread_t thread;
-    SearchThreadPool *pool;
+    MultiFileThreadPool *pool;
     uint32_t id;
-    uint64_t first_line;
-    uint64_t last_line;
     MatchResult *results;
     uint64_t result_count;
     uint64_t result_capacity;
     int error;
 } SearchWorker;
 
-struct SearchThreadPool {
+typedef struct {
+    const TraceStore *store;
+    const BmhSearcher *searcher;
+    AsciiBits query_bits;
+    bool use_bit_filter;
+    uint64_t from_line;
+    uint64_t limit;
+    uint32_t next_file_index;
+    pthread_mutex_t queue_mutex;
+} AllSearchJob;
+
+struct MultiFileThreadPool {
     pthread_mutex_t mutex;
     pthread_cond_t start_cond;
     pthread_cond_t done_cond;
@@ -90,7 +98,7 @@ struct SearchThreadPool {
     uint64_t generation;
     uint32_t thread_count;
     uint32_t active_workers;
-    SearchJob *job;
+    AllSearchJob *job;
     SearchWorker *workers;
 };
 
@@ -98,21 +106,22 @@ static LineView line_at_offset(const unsigned char *data, size_t size, size_t of
 static const unsigned char *bmh_find(const BmhSearcher *searcher,
                                      const unsigned char *haystack,
                                      size_t haystack_len);
-static uint32_t default_search_thread_count(void);
-static SearchThreadPool *search_pool_create(uint32_t thread_count);
-static void search_pool_destroy(SearchThreadPool *pool);
+static void search_pool_destroy(MultiFileThreadPool *pool);
 
 static void usage(FILE *stream) {
     fprintf(stream,
             "Usage:\n"
-            "  ak_search match --file PATH --query TEXT [--from-line N | --before-line N] [--limit N]\n"
-            "  ak_search context --file PATH --line N [--context N]\n"
-            "  ak_search context --file PATH --line N [--before N] [--after N]\n"
-            "  ak_search daemon --file PATH\n"
+            "  ak_search daemon --dir PATH\n"
+            "  ak_search daemon PATH\n"
             "  ak_search selftest\n"
             "\n"
-            "Match mode is ASCII case-insensitive. --before-line searches backward, nearest first.\n"
-            "Output: one JSON object per line with 1-based line numbers.\n");
+            "Daemon protocol:\n"
+            "  list\n"
+            "  match FILE_ID FROM_LINE BEFORE_LINE LIMIT QUERY_HEX\n"
+            "  trace_all_search LIMIT QUERY_HEX\n"
+            "  context FILE_ID LINE BEFORE AFTER\n"
+            "\n"
+            "FILE_ID is assigned by descending .log file size, starting at 1.\n");
 }
 
 static bool parse_u64(const char *text, uint64_t *out) {
@@ -124,6 +133,39 @@ static bool parse_u64(const char *text, uint64_t *out) {
     }
     *out = (uint64_t)value;
     return true;
+}
+
+static bool parse_u32(const char *text, uint32_t *out) {
+    uint64_t value = 0;
+    if (!parse_u64(text, &value) || value == 0 || value > UINT32_MAX) {
+        return false;
+    }
+    *out = (uint32_t)value;
+    return true;
+}
+
+static bool has_log_suffix(const char *name) {
+    size_t len = strlen(name);
+    return len >= 4 && strcmp(name + len - 4, ".log") == 0;
+}
+
+static char *join_path(const char *dir, const char *name) {
+    size_t dir_len = strlen(dir);
+    size_t name_len = strlen(name);
+    bool need_slash = dir_len > 0 && dir[dir_len - 1] != '/';
+    size_t total = dir_len + (need_slash ? 1 : 0) + name_len + 1;
+    char *out = malloc(total);
+    if (out == NULL) {
+        return NULL;
+    }
+    memcpy(out, dir, dir_len);
+    size_t pos = dir_len;
+    if (need_slash) {
+        out[pos++] = '/';
+    }
+    memcpy(out + pos, name, name_len);
+    out[pos + name_len] = '\0';
+    return out;
 }
 
 static int map_file(const char *path, MappedFile *mapped) {
@@ -184,12 +226,10 @@ static void unmap_file(MappedFile *mapped) {
 
 static void line_index_destroy(LineIndex *index) {
     if (index->offsets != NULL && index->capacity > 0) {
-        size_t bytes = (size_t)index->capacity * sizeof(*index->offsets);
-        munmap(index->offsets, bytes);
+        munmap(index->offsets, (size_t)index->capacity * sizeof(*index->offsets));
     }
     if (index->bits != NULL && index->capacity > 0) {
-        size_t bytes = (size_t)index->capacity * sizeof(*index->bits);
-        munmap(index->bits, bytes);
+        munmap(index->bits, (size_t)index->capacity * sizeof(*index->bits));
     }
     memset(index, 0, sizeof(*index));
 }
@@ -219,8 +259,7 @@ static inline void ascii_bits_add(AsciiBits *bits, unsigned char c) {
 static AsciiBits ascii_bits_for_text(const unsigned char *text, size_t len) {
     AsciiBits bits = ascii_bits_empty();
     for (size_t i = 0; i < len; i++) {
-        unsigned char c = fold_ascii_byte(text[i]);
-        ascii_bits_add(&bits, c);
+        ascii_bits_add(&bits, fold_ascii_byte(text[i]));
     }
     return bits;
 }
@@ -283,9 +322,9 @@ static LineView effective_search_line(LineView line) {
     return line;
 }
 
-static LineView search_line_for_index(const IndexedFile *indexed, uint64_t line_no) {
-    size_t offset = indexed->index.offsets[line_no - 1];
-    LineView line = line_at_offset(indexed->mapped.data, indexed->mapped.size, offset);
+static LineView search_line_for_index(const IndexedFile *file, uint64_t line_no) {
+    size_t offset = file->index.offsets[line_no - 1];
+    LineView line = line_at_offset(file->mapped.data, file->mapped.size, offset);
     return effective_search_line(line);
 }
 
@@ -314,37 +353,32 @@ static int line_index_reserve(LineIndex *index, uint64_t capacity) {
     if (capacity == 0) {
         return 0;
     }
-    if (capacity > (uint64_t)(SIZE_MAX / sizeof(*index->offsets))) {
+    if (capacity > (uint64_t)(SIZE_MAX / sizeof(*index->offsets)) ||
+        capacity > (uint64_t)(SIZE_MAX / sizeof(*index->bits))) {
         fprintf(stderr, "line index too large\n");
         return 1;
     }
 
-    size_t bytes = (size_t)capacity * sizeof(*index->offsets);
-    void *ptr = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (ptr == MAP_FAILED) {
+    size_t offset_bytes = (size_t)capacity * sizeof(*index->offsets);
+    void *offsets = mmap(NULL, offset_bytes, PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (offsets == MAP_FAILED) {
         fprintf(stderr, "mmap failed while preallocating line index: %s\n", strerror(errno));
         return 1;
     }
-    index->offsets = (size_t *)ptr;
-    index->capacity = capacity;
 
-    if (capacity > (uint64_t)(SIZE_MAX / sizeof(*index->bits))) {
-        fprintf(stderr, "line bitmap index too large\n");
-        munmap(index->offsets, (size_t)index->capacity * sizeof(*index->offsets));
-        index->offsets = NULL;
-        index->capacity = 0;
-        return 1;
-    }
-    bytes = (size_t)capacity * sizeof(*index->bits);
-    ptr = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (ptr == MAP_FAILED) {
+    size_t bit_bytes = (size_t)capacity * sizeof(*index->bits);
+    void *bits = mmap(NULL, bit_bytes, PROT_READ | PROT_WRITE,
+                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (bits == MAP_FAILED) {
         fprintf(stderr, "mmap failed while preallocating line bitmap index: %s\n", strerror(errno));
-        munmap(index->offsets, (size_t)index->capacity * sizeof(*index->offsets));
-        index->offsets = NULL;
-        index->capacity = 0;
+        munmap(offsets, offset_bytes);
         return 1;
     }
-    index->bits = (AsciiBits *)ptr;
+
+    index->offsets = (size_t *)offsets;
+    index->bits = (AsciiBits *)bits;
+    index->capacity = capacity;
     return 0;
 }
 
@@ -385,281 +419,174 @@ static int build_line_index(const MappedFile *mapped, LineIndex *index) {
     return 0;
 }
 
-static int indexed_file_open(const char *path, IndexedFile *indexed) {
-    memset(indexed, 0, sizeof(*indexed));
-    indexed->mapped.fd = -1;
-    if (map_file(path, &indexed->mapped) != 0) {
+static int indexed_file_open(const char *path, const char *name, IndexedFile *file) {
+    memset(file, 0, sizeof(*file));
+    file->mapped.fd = -1;
+    file->path = strdup(path);
+    file->name = strdup(name);
+    if (file->path == NULL || file->name == NULL) {
+        fprintf(stderr, "strdup failed while opening file metadata\n");
         return 1;
     }
-    if (build_line_index(&indexed->mapped, &indexed->index) != 0) {
-        line_index_destroy(&indexed->index);
-        unmap_file(&indexed->mapped);
+    if (map_file(path, &file->mapped) != 0) {
         return 1;
     }
-    indexed->search_pool = search_pool_create(default_search_thread_count());
-    if (indexed->search_pool == NULL) {
-        line_index_destroy(&indexed->index);
-        unmap_file(&indexed->mapped);
+    if (build_line_index(&file->mapped, &file->index) != 0) {
+        line_index_destroy(&file->index);
+        unmap_file(&file->mapped);
         return 1;
     }
     return 0;
 }
 
-static void indexed_file_close(IndexedFile *indexed) {
-    search_pool_destroy(indexed->search_pool);
-    indexed->search_pool = NULL;
-    line_index_destroy(&indexed->index);
-    unmap_file(&indexed->mapped);
+static void indexed_file_close(IndexedFile *file) {
+    line_index_destroy(&file->index);
+    unmap_file(&file->mapped);
+    free(file->path);
+    free(file->name);
+    memset(file, 0, sizeof(*file));
 }
 
-static bool indexed_line_start(const IndexedFile *indexed, uint64_t line_no, size_t *offset_out) {
-    if (line_no == 0 || line_no > indexed->index.count) {
+static bool indexed_line_start(const IndexedFile *file, uint64_t line_no, size_t *offset_out) {
+    if (line_no == 0 || line_no > file->index.count) {
         return false;
     }
-    *offset_out = indexed->index.offsets[line_no - 1];
+    *offset_out = file->index.offsets[line_no - 1];
     return true;
 }
 
-static uint32_t default_search_thread_count(void) {
-    long cores = sysconf(_SC_NPROCESSORS_ONLN);
-    if (cores < 1) {
-        cores = 1;
+static void trace_store_destroy(TraceStore *store) {
+    if (store->files != NULL) {
+        for (uint32_t i = 0; i < store->count; i++) {
+            indexed_file_close(&store->files[i]);
+        }
+        free(store->files);
     }
-    long threads = cores / 2;
-    if (threads < 1) {
-        threads = 1;
-    }
-    if (threads > UINT32_MAX) {
-        threads = UINT32_MAX;
-    }
-    return (uint32_t)threads;
+    memset(store, 0, sizeof(*store));
 }
 
-static bool worker_append_match(SearchWorker *worker, uint64_t line_no, uint64_t byte_offset) {
-    if (worker->result_count == worker->result_capacity) {
-        uint64_t new_capacity = worker->result_capacity == 0 ? 16 : worker->result_capacity * 2;
-        if (new_capacity < worker->result_capacity ||
-            new_capacity > (uint64_t)(SIZE_MAX / sizeof(*worker->results))) {
-            return false;
-        }
-        MatchResult *new_results = realloc(worker->results, (size_t)new_capacity * sizeof(*worker->results));
-        if (new_results == NULL) {
-            return false;
-        }
-        worker->results = new_results;
-        worker->result_capacity = new_capacity;
+typedef struct {
+    char *path;
+    char *name;
+    size_t size;
+} FileCandidate;
+
+static int compare_candidates_desc_size(const void *lhs, const void *rhs) {
+    const FileCandidate *a = (const FileCandidate *)lhs;
+    const FileCandidate *b = (const FileCandidate *)rhs;
+    if (a->size < b->size) {
+        return 1;
     }
-    worker->results[worker->result_count].line_no = line_no;
-    worker->results[worker->result_count].byte_offset = byte_offset;
-    worker->result_count++;
-    return true;
+    if (a->size > b->size) {
+        return -1;
+    }
+    return strcmp(a->name, b->name);
 }
 
-static void worker_run_search(SearchWorker *worker, SearchJob *job) {
-    worker->result_count = 0;
-    worker->error = 0;
-    if (worker->first_line == 0 || worker->last_line == 0 || worker->first_line > worker->last_line) {
+static void free_candidates(FileCandidate *items, uint32_t count) {
+    if (items == NULL) {
         return;
     }
-
-    const IndexedFile *indexed = job->indexed;
-    if (job->backward) {
-        for (uint64_t line_no = worker->last_line;
-             line_no >= worker->first_line && worker->result_count < job->limit;
-             line_no--) {
-            uint64_t cutoff = atomic_load_explicit(&job->cutoff_line, memory_order_relaxed);
-            if (cutoff != 0 && line_no < cutoff) {
-                break;
-            }
-            if (!job->use_bit_filter ||
-                ascii_bits_may_contain(indexed->index.bits[line_no - 1], job->query_bits)) {
-                LineView line = search_line_for_index(indexed, line_no);
-                if (bmh_find(job->searcher, line.start, line.len) != NULL) {
-                    if (!worker_append_match(worker, line_no, (uint64_t)indexed->index.offsets[line_no - 1])) {
-                        worker->error = 1;
-                        return;
-                    }
-                    if (worker->result_count == job->limit) {
-                        uint64_t current = atomic_load_explicit(&job->cutoff_line, memory_order_relaxed);
-                        while (line_no > current &&
-                               !atomic_compare_exchange_weak_explicit(
-                                   &job->cutoff_line,
-                                   &current,
-                                   line_no,
-                                   memory_order_relaxed,
-                                   memory_order_relaxed)) {
-                        }
-                    }
-                }
-            }
-            if (line_no == worker->first_line) {
-                break;
-            }
-        }
-        return;
+    for (uint32_t i = 0; i < count; i++) {
+        free(items[i].path);
+        free(items[i].name);
     }
-
-    for (uint64_t line_no = worker->first_line;
-         line_no <= worker->last_line && worker->result_count < job->limit;
-         line_no++) {
-        uint64_t cutoff = atomic_load_explicit(&job->cutoff_line, memory_order_relaxed);
-        if (cutoff != 0 && line_no > cutoff) {
-            break;
-        }
-        if (!job->use_bit_filter ||
-            ascii_bits_may_contain(indexed->index.bits[line_no - 1], job->query_bits)) {
-            LineView line = search_line_for_index(indexed, line_no);
-            if (bmh_find(job->searcher, line.start, line.len) != NULL) {
-                if (!worker_append_match(worker, line_no, (uint64_t)indexed->index.offsets[line_no - 1])) {
-                    worker->error = 1;
-                    return;
-                }
-                if (worker->result_count == job->limit) {
-                    uint64_t current = atomic_load_explicit(&job->cutoff_line, memory_order_relaxed);
-                    while ((current == 0 || line_no < current) &&
-                           !atomic_compare_exchange_weak_explicit(
-                               &job->cutoff_line,
-                               &current,
-                               line_no,
-                               memory_order_relaxed,
-                               memory_order_relaxed)) {
-                    }
-                }
-            }
-        }
-    }
+    free(items);
 }
 
-static void *search_worker_main(void *arg) {
-    SearchWorker *worker = (SearchWorker *)arg;
-    SearchThreadPool *pool = worker->pool;
-    uint64_t seen_generation = 0;
+static int discover_log_files(const char *dir_path, FileCandidate **items_out, uint32_t *count_out) {
+    DIR *dir = opendir(dir_path);
+    if (dir == NULL) {
+        fprintf(stderr, "opendir failed: %s: %s\n", dir_path, strerror(errno));
+        return 1;
+    }
 
-    pthread_mutex_lock(&pool->mutex);
-    while (true) {
-        while (!pool->stop && pool->generation == seen_generation) {
-            pthread_cond_wait(&pool->start_cond, &pool->mutex);
+    FileCandidate *items = NULL;
+    uint32_t count = 0;
+    uint32_t capacity = 0;
+    struct dirent *entry = NULL;
+    while ((entry = readdir(dir)) != NULL) {
+        if (!has_log_suffix(entry->d_name)) {
+            continue;
         }
-        if (pool->stop) {
-            pthread_mutex_unlock(&pool->mutex);
-            return NULL;
-        }
-        SearchJob *job = pool->job;
-        seen_generation = pool->generation;
-        pthread_mutex_unlock(&pool->mutex);
-
-        worker_run_search(worker, job);
-
-        pthread_mutex_lock(&pool->mutex);
-        if (pool->active_workers > 0) {
-            pool->active_workers--;
-        }
-        if (pool->active_workers == 0) {
-            pthread_cond_signal(&pool->done_cond);
-        }
-    }
-}
-
-static SearchThreadPool *search_pool_create(uint32_t thread_count) {
-    if (thread_count == 0) {
-        thread_count = 1;
-    }
-
-    SearchThreadPool *pool = calloc(1, sizeof(*pool));
-    if (pool == NULL) {
-        fprintf(stderr, "calloc failed while creating search thread pool\n");
-        return NULL;
-    }
-    pool->thread_count = thread_count;
-    pool->workers = calloc(thread_count, sizeof(*pool->workers));
-    if (pool->workers == NULL) {
-        fprintf(stderr, "calloc failed while creating search workers\n");
-        free(pool);
-        return NULL;
-    }
-    int mutex_ready = 0;
-    int start_cond_ready = 0;
-    int done_cond_ready = 0;
-    if (pthread_mutex_init(&pool->mutex, NULL) == 0) {
-        mutex_ready = 1;
-    }
-    if (mutex_ready && pthread_cond_init(&pool->start_cond, NULL) == 0) {
-        start_cond_ready = 1;
-    }
-    if (mutex_ready && start_cond_ready && pthread_cond_init(&pool->done_cond, NULL) == 0) {
-        done_cond_ready = 1;
-    }
-    if (!mutex_ready || !start_cond_ready || !done_cond_ready) {
-        fprintf(stderr, "pthread primitive init failed\n");
-        if (done_cond_ready) {
-            pthread_cond_destroy(&pool->done_cond);
-        }
-        if (start_cond_ready) {
-            pthread_cond_destroy(&pool->start_cond);
-        }
-        if (mutex_ready) {
-            pthread_mutex_destroy(&pool->mutex);
-        }
-        free(pool->workers);
-        free(pool);
-        return NULL;
-    }
-
-    for (uint32_t i = 0; i < thread_count; i++) {
-        pool->workers[i].pool = pool;
-        pool->workers[i].id = i;
-        int err = pthread_create(&pool->workers[i].thread, NULL, search_worker_main, &pool->workers[i]);
-        if (err != 0) {
-            fprintf(stderr, "pthread_create failed: %s\n", strerror(err));
-            pool->thread_count = i;
-            search_pool_destroy(pool);
-            return NULL;
-        }
-    }
-    return pool;
-}
-
-static void search_pool_destroy(SearchThreadPool *pool) {
-    if (pool == NULL) {
-        return;
-    }
-    pthread_mutex_lock(&pool->mutex);
-    pool->stop = true;
-    pthread_cond_broadcast(&pool->start_cond);
-    pthread_mutex_unlock(&pool->mutex);
-
-    for (uint32_t i = 0; i < pool->thread_count; i++) {
-        pthread_join(pool->workers[i].thread, NULL);
-        free(pool->workers[i].results);
-    }
-    pthread_cond_destroy(&pool->done_cond);
-    pthread_cond_destroy(&pool->start_cond);
-    pthread_mutex_destroy(&pool->mutex);
-    free(pool->workers);
-    free(pool);
-}
-
-static int search_pool_run(SearchThreadPool *pool, SearchJob *job) {
-    if (pool->thread_count == 0) {
-        return 0;
-    }
-    pthread_mutex_lock(&pool->mutex);
-    pool->job = job;
-    pool->active_workers = pool->thread_count;
-    pool->generation++;
-    pthread_cond_broadcast(&pool->start_cond);
-    while (pool->active_workers > 0) {
-        pthread_cond_wait(&pool->done_cond, &pool->mutex);
-    }
-    pool->job = NULL;
-    pthread_mutex_unlock(&pool->mutex);
-
-    for (uint32_t i = 0; i < pool->thread_count; i++) {
-        if (pool->workers[i].error != 0) {
+        char *path = join_path(dir_path, entry->d_name);
+        if (path == NULL) {
+            closedir(dir);
+            free_candidates(items, count);
             return 1;
         }
+        struct stat st;
+        if (stat(path, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < 0) {
+            free(path);
+            continue;
+        }
+        if (count == capacity) {
+            uint32_t new_capacity = capacity == 0 ? 8 : capacity * 2;
+            FileCandidate *new_items = realloc(items, (size_t)new_capacity * sizeof(*items));
+            if (new_items == NULL) {
+                free(path);
+                closedir(dir);
+                free_candidates(items, count);
+                return 1;
+            }
+            items = new_items;
+            capacity = new_capacity;
+        }
+        items[count].path = path;
+        items[count].name = strdup(entry->d_name);
+        items[count].size = (size_t)st.st_size;
+        if (items[count].name == NULL) {
+            closedir(dir);
+            free_candidates(items, count + 1);
+            return 1;
+        }
+        count++;
     }
+    closedir(dir);
+
+    qsort(items, count, sizeof(*items), compare_candidates_desc_size);
+    *items_out = items;
+    *count_out = count;
     return 0;
+}
+
+static int trace_store_open_dir(const char *dir_path, TraceStore *store) {
+    memset(store, 0, sizeof(*store));
+    FileCandidate *candidates = NULL;
+    uint32_t count = 0;
+    if (discover_log_files(dir_path, &candidates, &count) != 0) {
+        return 1;
+    }
+    if (count == 0) {
+        fprintf(stderr, "no .log files found in directory: %s\n", dir_path);
+        free_candidates(candidates, count);
+        return 1;
+    }
+
+    store->files = calloc(count, sizeof(*store->files));
+    if (store->files == NULL) {
+        free_candidates(candidates, count);
+        return 1;
+    }
+    store->capacity = count;
+    for (uint32_t i = 0; i < count; i++) {
+        if (indexed_file_open(candidates[i].path, candidates[i].name, &store->files[i]) != 0) {
+            free_candidates(candidates, count);
+            trace_store_destroy(store);
+            return 1;
+        }
+        store->files[i].id = i + 1;
+        store->count++;
+    }
+    free_candidates(candidates, count);
+    return 0;
+}
+
+static IndexedFile *trace_store_get_file(const TraceStore *store, uint32_t file_id) {
+    if (file_id == 0 || file_id > store->count) {
+        return NULL;
+    }
+    return &((TraceStore *)store)->files[file_id - 1];
 }
 
 static void init_ascii_lower(unsigned char lower[256]) {
@@ -757,82 +684,6 @@ static LineView line_at_offset(const unsigned char *data, size_t size, size_t of
     return line;
 }
 
-static bool next_line_start(const MappedFile *mapped, size_t offset, size_t *next_offset_out) {
-    if (offset >= mapped->size) {
-        return false;
-    }
-
-    const unsigned char *start = mapped->data + offset;
-    const unsigned char *end = mapped->data + mapped->size;
-    const unsigned char *newline = memchr(start, '\n', (size_t)(end - start));
-    if (newline == NULL || newline + 1 >= end) {
-        return false;
-    }
-
-    *next_offset_out = (size_t)((newline + 1) - mapped->data);
-    return true;
-}
-
-static bool prev_line_start(const MappedFile *mapped, size_t offset, size_t *prev_offset_out) {
-    if (offset == 0 || mapped->size == 0) {
-        return false;
-    }
-
-    size_t pos = offset - 1;
-    while (pos > 0) {
-        pos--;
-        if (mapped->data[pos] == '\n') {
-            *prev_offset_out = pos + 1;
-            return true;
-        }
-    }
-
-    *prev_offset_out = 0;
-    return true;
-}
-
-static bool direct_line_start(const MappedFile *mapped,
-                              uint64_t target_line,
-                              uint64_t *line_no_out,
-                              size_t *offset_out) {
-    if (mapped->size == 0 || target_line == 0) {
-        return false;
-    }
-
-    uint64_t line_no = 1;
-    size_t offset = 0;
-    while (line_no < target_line) {
-        size_t next_offset = 0;
-        if (!next_line_start(mapped, offset, &next_offset)) {
-            return false;
-        }
-        offset = next_offset;
-        line_no++;
-    }
-
-    *line_no_out = line_no;
-    *offset_out = offset;
-    return true;
-}
-
-static void direct_last_line_start(const MappedFile *mapped,
-                                   uint64_t *line_no_out,
-                                   size_t *offset_out) {
-    uint64_t line_no = 1;
-    size_t offset = 0;
-    while (true) {
-        size_t next_offset = 0;
-        if (!next_line_start(mapped, offset, &next_offset)) {
-            break;
-        }
-        offset = next_offset;
-        line_no++;
-    }
-
-    *line_no_out = line_no;
-    *offset_out = offset;
-}
-
 static void json_write_string(const unsigned char *text, size_t len) {
     putchar('"');
     for (size_t i = 0; i < len; i++) {
@@ -876,12 +727,15 @@ static void json_write_cstr(const char *text) {
 }
 
 static void emit_line(const char *type,
+                      uint32_t file_id,
                       uint64_t line_no,
                       uint64_t byte_offset,
                       bool is_target,
                       LineView line) {
-    printf("{\"type\":\"%s\",\"line\":%" PRIu64 ",\"byte_offset\":%" PRIu64,
+    printf("{\"type\":\"%s\",\"file_id\":%" PRIu32 ",\"line\":%" PRIu64
+           ",\"byte_offset\":%" PRIu64,
            type,
+           file_id,
            line_no,
            byte_offset);
     if (is_target) {
@@ -934,53 +788,118 @@ static char *hex_decode_to_cstr(const char *hex) {
     return out;
 }
 
-static int run_match_forward(const IndexedFile *indexed,
-                             const char *query,
-                             uint64_t from_line,
-                             uint64_t limit) {
-    if (limit == 0 || indexed->mapped.size == 0 || from_line > indexed->index.count) {
+static bool append_match(MatchResult **results,
+                         uint64_t *count,
+                         uint64_t *capacity,
+                         uint32_t file_id,
+                         uint64_t line_no,
+                         uint64_t byte_offset) {
+    if (*count == *capacity) {
+        uint64_t new_capacity = *capacity == 0 ? 16 : *capacity * 2;
+        if (new_capacity < *capacity || new_capacity > (uint64_t)(SIZE_MAX / sizeof(**results))) {
+            return false;
+        }
+        MatchResult *new_results = realloc(*results, (size_t)new_capacity * sizeof(**results));
+        if (new_results == NULL) {
+            return false;
+        }
+        *results = new_results;
+        *capacity = new_capacity;
+    }
+    (*results)[*count].file_id = file_id;
+    (*results)[*count].line_no = line_no;
+    (*results)[*count].byte_offset = byte_offset;
+    (*count)++;
+    return true;
+}
+
+static int collect_file_matches_forward(const IndexedFile *file,
+                                        const BmhSearcher *searcher,
+                                        AsciiBits query_bits,
+                                        bool use_bit_filter,
+                                        uint64_t from_line,
+                                        uint64_t limit,
+                                        MatchResult **results,
+                                        uint64_t *count,
+                                        uint64_t *capacity) {
+    if (limit == 0 || file->mapped.size == 0 || from_line > file->index.count) {
         return 0;
     }
 
-    BmhSearcher searcher;
-    if (bmh_init(&searcher, query) != 0) {
-        return 1;
-    }
-    bool complete_query_bits = false;
-    AsciiBits query_bits = ascii_bits_for_query(query, &complete_query_bits);
-
-    uint64_t emitted = 0;
-    for (uint64_t line_no = from_line; line_no <= indexed->index.count && emitted < limit; line_no++) {
-        if (complete_query_bits &&
-            !ascii_bits_may_contain(indexed->index.bits[line_no - 1], query_bits)) {
+    uint64_t start_count = *count;
+    for (uint64_t line_no = from_line;
+         line_no <= file->index.count && (*count - start_count) < limit;
+         line_no++) {
+        if (use_bit_filter && !ascii_bits_may_contain(file->index.bits[line_no - 1], query_bits)) {
             continue;
         }
-        size_t offset = indexed->index.offsets[line_no - 1];
-        LineView effective = search_line_for_index(indexed, line_no);
-        if (bmh_find(&searcher, effective.start, effective.len) != NULL) {
-            LineView line = line_at_offset(indexed->mapped.data, indexed->mapped.size, offset);
-            emit_line("match", line_no, (uint64_t)offset, false, line);
-            emitted++;
+        LineView effective = search_line_for_index(file, line_no);
+        if (bmh_find(searcher, effective.start, effective.len) != NULL) {
+            size_t offset = file->index.offsets[line_no - 1];
+            if (!append_match(results, count, capacity, file->id, line_no, (uint64_t)offset)) {
+                return 1;
+            }
         }
     }
-
-    bmh_destroy(&searcher);
     return 0;
 }
 
-static int run_match_backward(const IndexedFile *indexed,
-                              const char *query,
-                              uint64_t before_line,
-                              uint64_t limit) {
-    if (limit == 0 || indexed->mapped.size == 0 || before_line <= 1) {
+static int collect_file_matches_backward(const IndexedFile *file,
+                                         const BmhSearcher *searcher,
+                                         AsciiBits query_bits,
+                                         bool use_bit_filter,
+                                         uint64_t before_line,
+                                         uint64_t limit,
+                                         MatchResult **results,
+                                         uint64_t *count,
+                                         uint64_t *capacity) {
+    if (limit == 0 || file->mapped.size == 0 || before_line <= 1) {
         return 0;
     }
 
     uint64_t line_no = before_line - 1;
-    if (line_no > indexed->index.count) {
-        line_no = indexed->index.count;
+    if (line_no > file->index.count) {
+        line_no = file->index.count;
     }
 
+    uint64_t start_count = *count;
+    while (line_no >= 1 && (*count - start_count) < limit) {
+        if (!use_bit_filter || ascii_bits_may_contain(file->index.bits[line_no - 1], query_bits)) {
+            LineView effective = search_line_for_index(file, line_no);
+            if (bmh_find(searcher, effective.start, effective.len) != NULL) {
+                size_t offset = file->index.offsets[line_no - 1];
+                if (!append_match(results, count, capacity, file->id, line_no, (uint64_t)offset)) {
+                    return 1;
+                }
+            }
+        }
+        if (line_no == 1) {
+            break;
+        }
+        line_no--;
+    }
+    return 0;
+}
+
+static int emit_matches(const TraceStore *store, const MatchResult *results, uint64_t count) {
+    for (uint64_t i = 0; i < count; i++) {
+        const MatchResult *result = &results[i];
+        IndexedFile *file = trace_store_get_file(store, result->file_id);
+        if (file == NULL) {
+            return 1;
+        }
+        LineView line = line_at_offset(file->mapped.data, file->mapped.size, (size_t)result->byte_offset);
+        emit_line("match", result->file_id, result->line_no, result->byte_offset, false, line);
+    }
+    return 0;
+}
+
+static int run_match_single_file(const TraceStore *store,
+                                 IndexedFile *file,
+                                 const char *query,
+                                 uint64_t from_line,
+                                 uint64_t before_line,
+                                 uint64_t limit) {
     BmhSearcher searcher;
     if (bmh_init(&searcher, query) != 0) {
         return 1;
@@ -988,486 +907,341 @@ static int run_match_backward(const IndexedFile *indexed,
     bool complete_query_bits = false;
     AsciiBits query_bits = ascii_bits_for_query(query, &complete_query_bits);
 
-    uint64_t emitted = 0;
-    while (line_no >= 1 && emitted < limit) {
-        if (complete_query_bits &&
-            !ascii_bits_may_contain(indexed->index.bits[line_no - 1], query_bits)) {
-            if (line_no == 1) {
+    MatchResult *results = NULL;
+    uint64_t count = 0;
+    uint64_t capacity = 0;
+    int result = before_line != 0
+        ? collect_file_matches_backward(file, &searcher, query_bits, complete_query_bits,
+                                        before_line, limit, &results, &count, &capacity)
+        : collect_file_matches_forward(file, &searcher, query_bits, complete_query_bits,
+                                       from_line, limit, &results, &count, &capacity);
+    if (result == 0) {
+        result = emit_matches(store, results, count);
+    }
+    free(results);
+    bmh_destroy(&searcher);
+    return result;
+}
+
+static uint32_t default_search_thread_count(void) {
+    long cores = sysconf(_SC_NPROCESSORS_ONLN);
+    if (cores < 1) {
+        cores = 1;
+    }
+    long threads = cores / 2;
+    if (threads < 1) {
+        threads = 1;
+    }
+    if (threads > UINT32_MAX) {
+        threads = UINT32_MAX;
+    }
+    return (uint32_t)threads;
+}
+
+static void worker_clear_results(SearchWorker *worker) {
+    worker->result_count = 0;
+    worker->error = 0;
+}
+
+static void *search_worker_main(void *arg) {
+    SearchWorker *worker = (SearchWorker *)arg;
+    MultiFileThreadPool *pool = worker->pool;
+    uint64_t seen_generation = 0;
+
+    pthread_mutex_lock(&pool->mutex);
+    while (true) {
+        while (!pool->stop && pool->generation == seen_generation) {
+            pthread_cond_wait(&pool->start_cond, &pool->mutex);
+        }
+        if (pool->stop) {
+            pthread_mutex_unlock(&pool->mutex);
+            return NULL;
+        }
+
+        AllSearchJob *job = pool->job;
+        seen_generation = pool->generation;
+        pthread_mutex_unlock(&pool->mutex);
+
+        worker_clear_results(worker);
+        while (true) {
+            pthread_mutex_lock(&job->queue_mutex);
+            uint32_t file_index = job->next_file_index;
+            if (file_index < job->store->count) {
+                job->next_file_index++;
+            }
+            pthread_mutex_unlock(&job->queue_mutex);
+
+            if (file_index >= job->store->count) {
                 break;
             }
-            line_no--;
-            continue;
+
+            const IndexedFile *file = &job->store->files[file_index];
+            if (collect_file_matches_forward(file, job->searcher, job->query_bits, job->use_bit_filter,
+                                             job->from_line, job->limit, &worker->results, &worker->result_count,
+                                             &worker->result_capacity) != 0) {
+                worker->error = 1;
+                break;
+            }
         }
-        size_t offset = indexed->index.offsets[line_no - 1];
-        LineView effective = search_line_for_index(indexed, line_no);
-        if (bmh_find(&searcher, effective.start, effective.len) != NULL) {
-            LineView line = line_at_offset(indexed->mapped.data, indexed->mapped.size, offset);
-            emit_line("match", line_no, (uint64_t)offset, false, line);
-            emitted++;
+
+        pthread_mutex_lock(&pool->mutex);
+        if (pool->active_workers > 0) {
+            pool->active_workers--;
         }
-        if (line_no == 1) {
-            break;
+        if (pool->active_workers == 0) {
+            pthread_cond_signal(&pool->done_cond);
         }
-        line_no--;
+    }
+}
+
+static MultiFileThreadPool *search_pool_create(uint32_t thread_count) {
+    if (thread_count == 0) {
+        thread_count = 1;
     }
 
-    bmh_destroy(&searcher);
+    MultiFileThreadPool *pool = calloc(1, sizeof(*pool));
+    if (pool == NULL) {
+        fprintf(stderr, "calloc failed while creating search thread pool\n");
+        return NULL;
+    }
+    pool->thread_count = thread_count;
+    pool->workers = calloc(thread_count, sizeof(*pool->workers));
+    if (pool->workers == NULL) {
+        free(pool);
+        return NULL;
+    }
+
+    int mutex_ready = 0;
+    int start_cond_ready = 0;
+    int done_cond_ready = 0;
+    if (pthread_mutex_init(&pool->mutex, NULL) == 0) {
+        mutex_ready = 1;
+    }
+    if (mutex_ready && pthread_cond_init(&pool->start_cond, NULL) == 0) {
+        start_cond_ready = 1;
+    }
+    if (mutex_ready && start_cond_ready && pthread_cond_init(&pool->done_cond, NULL) == 0) {
+        done_cond_ready = 1;
+    }
+    if (!mutex_ready || !start_cond_ready || !done_cond_ready) {
+        if (done_cond_ready) pthread_cond_destroy(&pool->done_cond);
+        if (start_cond_ready) pthread_cond_destroy(&pool->start_cond);
+        if (mutex_ready) pthread_mutex_destroy(&pool->mutex);
+        free(pool->workers);
+        free(pool);
+        return NULL;
+    }
+
+    for (uint32_t i = 0; i < thread_count; i++) {
+        pool->workers[i].pool = pool;
+        pool->workers[i].id = i;
+        int err = pthread_create(&pool->workers[i].thread, NULL, search_worker_main, &pool->workers[i]);
+        if (err != 0) {
+            fprintf(stderr, "pthread_create failed: %s\n", strerror(err));
+            pool->thread_count = i;
+            search_pool_destroy(pool);
+            return NULL;
+        }
+    }
+    return pool;
+}
+
+static void search_pool_destroy(MultiFileThreadPool *pool) {
+    if (pool == NULL) {
+        return;
+    }
+    pthread_mutex_lock(&pool->mutex);
+    pool->stop = true;
+    pthread_cond_broadcast(&pool->start_cond);
+    pthread_mutex_unlock(&pool->mutex);
+
+    for (uint32_t i = 0; i < pool->thread_count; i++) {
+        pthread_join(pool->workers[i].thread, NULL);
+        free(pool->workers[i].results);
+    }
+    pthread_cond_destroy(&pool->done_cond);
+    pthread_cond_destroy(&pool->start_cond);
+    pthread_mutex_destroy(&pool->mutex);
+    free(pool->workers);
+    free(pool);
+}
+
+static int search_pool_run_all(MultiFileThreadPool *pool, AllSearchJob *job) {
+    if (pthread_mutex_init(&job->queue_mutex, NULL) != 0) {
+        return 1;
+    }
+    job->next_file_index = 0;
+
+    pthread_mutex_lock(&pool->mutex);
+    pool->job = job;
+    pool->active_workers = pool->thread_count;
+    pool->generation++;
+    pthread_cond_broadcast(&pool->start_cond);
+    while (pool->active_workers > 0) {
+        pthread_cond_wait(&pool->done_cond, &pool->mutex);
+    }
+    pool->job = NULL;
+    pthread_mutex_unlock(&pool->mutex);
+
+    pthread_mutex_destroy(&job->queue_mutex);
+
+    for (uint32_t i = 0; i < pool->thread_count; i++) {
+        if (pool->workers[i].error != 0) {
+            return 1;
+        }
+    }
     return 0;
 }
 
-static int run_context(const IndexedFile *indexed,
+static int compare_match_results(const void *lhs, const void *rhs) {
+    const MatchResult *a = (const MatchResult *)lhs;
+    const MatchResult *b = (const MatchResult *)rhs;
+    if (a->file_id != b->file_id) {
+        return a->file_id < b->file_id ? -1 : 1;
+    }
+    if (a->line_no != b->line_no) {
+        return a->line_no < b->line_no ? -1 : 1;
+    }
+    return 0;
+}
+
+static int run_match_all_files(const TraceStore *store,
+                               MultiFileThreadPool *pool,
+                               const char *query,
+                               uint64_t limit) {
+    BmhSearcher searcher;
+    if (bmh_init(&searcher, query) != 0) {
+        return 1;
+    }
+    bool complete_query_bits = false;
+    AsciiBits query_bits = ascii_bits_for_query(query, &complete_query_bits);
+
+    AllSearchJob job;
+    memset(&job, 0, sizeof(job));
+    job.store = store;
+    job.searcher = &searcher;
+    job.query_bits = query_bits;
+    job.use_bit_filter = complete_query_bits;
+    job.from_line = 1;
+    job.limit = limit;
+
+    int result = search_pool_run_all(pool, &job);
+    if (result != 0) {
+        bmh_destroy(&searcher);
+        return result;
+    }
+
+    uint64_t total = 0;
+    for (uint32_t i = 0; i < pool->thread_count; i++) {
+        total += pool->workers[i].result_count;
+    }
+
+    MatchResult *merged = NULL;
+    if (total > 0) {
+        merged = malloc((size_t)total * sizeof(*merged));
+        if (merged == NULL) {
+            bmh_destroy(&searcher);
+            return 1;
+        }
+    }
+
+    uint64_t pos = 0;
+    for (uint32_t i = 0; i < pool->thread_count; i++) {
+        SearchWorker *worker = &pool->workers[i];
+        if (worker->result_count > 0) {
+            memcpy(merged + pos, worker->results, (size_t)worker->result_count * sizeof(*merged));
+            pos += worker->result_count;
+        }
+    }
+
+    qsort(merged, total, sizeof(*merged), compare_match_results);
+    result = emit_matches(store, merged, total);
+    free(merged);
+    bmh_destroy(&searcher);
+    return result;
+}
+
+static int run_context(const IndexedFile *file,
                        uint64_t target_line,
                        uint64_t before,
                        uint64_t after) {
-    if (indexed->mapped.size == 0) {
+    if (file->mapped.size == 0) {
         return 0;
     }
 
     uint64_t first_line = target_line > before ? target_line - before : 1;
     uint64_t last_line = UINT64_MAX - target_line < after ? UINT64_MAX : target_line + after;
-    if (last_line > indexed->index.count) {
-        last_line = indexed->index.count;
+    if (last_line > file->index.count) {
+        last_line = file->index.count;
     }
 
     size_t offset = 0;
-    if (!indexed_line_start(indexed, first_line, &offset)) {
+    if (!indexed_line_start(file, first_line, &offset)) {
         return 0;
     }
 
     for (uint64_t line_no = first_line; line_no <= last_line; line_no++) {
-        offset = indexed->index.offsets[line_no - 1];
-        LineView line = line_at_offset(indexed->mapped.data, indexed->mapped.size, offset);
-        emit_line("context", line_no, (uint64_t)offset, line_no == target_line, line);
+        offset = file->index.offsets[line_no - 1];
+        LineView line = line_at_offset(file->mapped.data, file->mapped.size, offset);
+        emit_line("context", file->id, line_no, (uint64_t)offset, line_no == target_line, line);
     }
     return 0;
 }
 
-static void assign_forward_ranges(SearchThreadPool *pool, uint64_t first_line, uint64_t last_line) {
-    uint64_t total = last_line - first_line + 1;
-    uint64_t base = total / pool->thread_count;
-    uint64_t extra = total % pool->thread_count;
-    uint64_t cursor = first_line;
-
-    for (uint32_t i = 0; i < pool->thread_count; i++) {
-        uint64_t span = base + (i < extra ? 1 : 0);
-        if (span == 0) {
-            pool->workers[i].first_line = 0;
-            pool->workers[i].last_line = 0;
-            continue;
-        }
-        pool->workers[i].first_line = cursor;
-        pool->workers[i].last_line = cursor + span - 1;
-        cursor += span;
+static int handle_daemon_list(const TraceStore *store) {
+    for (uint32_t i = 0; i < store->count; i++) {
+        const IndexedFile *file = &store->files[i];
+        double mb = (double)file->mapped.size / (1024.0 * 1024.0);
+        printf("{\"type\":\"file\",\"file_id\":%" PRIu32 ",\"size_mb\":%.3f,\"line_count\":%" PRIu64
+               "}\n",
+               file->id,
+               mb,
+               file->index.count);
     }
+    return emit_daemon_end("ok", NULL);
 }
 
-static int emit_parallel_forward(SearchThreadPool *pool,
-                                 const IndexedFile *indexed,
-                                 uint64_t limit) {
-    uint64_t emitted = 0;
-    for (uint32_t i = 0; i < pool->thread_count && emitted < limit; i++) {
-        SearchWorker *worker = &pool->workers[i];
-        for (uint64_t j = 0; j < worker->result_count && emitted < limit; j++) {
-            MatchResult result = worker->results[j];
-            LineView line = line_at_offset(indexed->mapped.data, indexed->mapped.size, (size_t)result.byte_offset);
-            emit_line("match", result.line_no, result.byte_offset, false, line);
-            emitted++;
-        }
-    }
-    return 0;
-}
-
-static int emit_parallel_backward(SearchThreadPool *pool,
-                                  const IndexedFile *indexed,
-                                  uint64_t limit) {
-    uint64_t emitted = 0;
-    uint32_t *positions = calloc(pool->thread_count, sizeof(*positions));
-    if (positions == NULL) {
-        fprintf(stderr, "calloc failed while merging backward search results\n");
-        return 1;
-    }
-
-    while (emitted < limit) {
-        uint32_t best_worker = UINT32_MAX;
-        uint64_t best_line = 0;
-        for (uint32_t i = 0; i < pool->thread_count; i++) {
-            SearchWorker *worker = &pool->workers[i];
-            if ((uint64_t)positions[i] >= worker->result_count) {
-                continue;
-            }
-            uint64_t candidate = worker->results[positions[i]].line_no;
-            if (best_worker == UINT32_MAX || candidate > best_line) {
-                best_worker = i;
-                best_line = candidate;
-            }
-        }
-        if (best_worker == UINT32_MAX) {
-            break;
-        }
-        SearchWorker *worker = &pool->workers[best_worker];
-        MatchResult result = worker->results[positions[best_worker]];
-        positions[best_worker]++;
-        LineView line = line_at_offset(indexed->mapped.data, indexed->mapped.size, (size_t)result.byte_offset);
-        emit_line("match", result.line_no, result.byte_offset, false, line);
-        emitted++;
-    }
-
-    free(positions);
-    return 0;
-}
-
-static int run_match_forward_parallel(const IndexedFile *indexed,
-                                      const char *query,
-                                      uint64_t from_line,
-                                      uint64_t limit) {
-    if (limit == 0 || indexed->mapped.size == 0 || from_line > indexed->index.count) {
-        return 0;
-    }
-
-    BmhSearcher searcher;
-    if (bmh_init(&searcher, query) != 0) {
-        return 1;
-    }
-    bool complete_query_bits = false;
-    AsciiBits query_bits = ascii_bits_for_query(query, &complete_query_bits);
-    SearchThreadPool *pool = indexed->search_pool;
-    assign_forward_ranges(pool, from_line, indexed->index.count);
-
-    SearchJob job;
-    job.indexed = indexed;
-    job.searcher = &searcher;
-    job.query_bits = query_bits;
-    atomic_init(&job.cutoff_line, 0);
-    job.use_bit_filter = complete_query_bits;
-    job.limit = limit;
-    job.backward = false;
-
-    int result = search_pool_run(pool, &job);
-    if (result == 0) {
-        result = emit_parallel_forward(pool, indexed, limit);
-    }
-    bmh_destroy(&searcher);
-    return result;
-}
-
-static int run_match_backward_parallel(const IndexedFile *indexed,
-                                       const char *query,
-                                       uint64_t before_line,
-                                       uint64_t limit) {
-    if (limit == 0 || indexed->mapped.size == 0 || before_line <= 1) {
-        return 0;
-    }
-
-    uint64_t last_line = before_line - 1;
-    if (last_line > indexed->index.count) {
-        last_line = indexed->index.count;
-    }
-    if (last_line == 0) {
-        return 0;
-    }
-
-    BmhSearcher searcher;
-    if (bmh_init(&searcher, query) != 0) {
-        return 1;
-    }
-    bool complete_query_bits = false;
-    AsciiBits query_bits = ascii_bits_for_query(query, &complete_query_bits);
-    SearchThreadPool *pool = indexed->search_pool;
-    assign_forward_ranges(pool, 1, last_line);
-
-    SearchJob job;
-    job.indexed = indexed;
-    job.searcher = &searcher;
-    job.query_bits = query_bits;
-    atomic_init(&job.cutoff_line, 0);
-    job.use_bit_filter = complete_query_bits;
-    job.limit = limit;
-    job.backward = true;
-
-    int result = search_pool_run(pool, &job);
-    if (result == 0) {
-        result = emit_parallel_backward(pool, indexed, limit);
-    }
-    bmh_destroy(&searcher);
-    return result;
-}
-
-static int run_match_forward_direct(const MappedFile *mapped,
-                                    const char *query,
-                                    uint64_t from_line,
-                                    uint64_t limit) {
-    if (limit == 0 || mapped->size == 0) {
-        return 0;
-    }
-
-    uint64_t line_no = 0;
-    size_t offset = 0;
-    if (!direct_line_start(mapped, from_line, &line_no, &offset)) {
-        return 0;
-    }
-
-    BmhSearcher searcher;
-    if (bmh_init(&searcher, query) != 0) {
-        return 1;
-    }
-    bool complete_query_bits = false;
-    AsciiBits query_bits = ascii_bits_for_query(query, &complete_query_bits);
-
-    uint64_t emitted = 0;
-    while (emitted < limit) {
-        LineView line = line_at_offset(mapped->data, mapped->size, offset);
-        LineView effective = effective_search_line(line);
-        if ((!complete_query_bits ||
-             ascii_bits_may_contain(ascii_bits_for_text(effective.start, effective.len), query_bits)) &&
-            bmh_find(&searcher, effective.start, effective.len) != NULL) {
-            emit_line("match", line_no, (uint64_t)offset, false, line);
-            emitted++;
-        }
-
-        size_t next_offset = 0;
-        if (!next_line_start(mapped, offset, &next_offset)) {
-            break;
-        }
-        offset = next_offset;
-        line_no++;
-    }
-
-    bmh_destroy(&searcher);
-    return 0;
-}
-
-static int run_match_backward_direct(const MappedFile *mapped,
-                                     const char *query,
-                                     uint64_t before_line,
-                                     uint64_t limit) {
-    if (limit == 0 || mapped->size == 0 || before_line <= 1) {
-        return 0;
-    }
-
-    uint64_t line_no = 0;
-    size_t offset = 0;
-    uint64_t anchor_line = 0;
-    size_t anchor_offset = 0;
-    if (direct_line_start(mapped, before_line, &anchor_line, &anchor_offset)) {
-        if (!prev_line_start(mapped, anchor_offset, &offset)) {
-            return 0;
-        }
-        line_no = anchor_line - 1;
-    } else {
-        direct_last_line_start(mapped, &line_no, &offset);
-    }
-
-    BmhSearcher searcher;
-    if (bmh_init(&searcher, query) != 0) {
-        return 1;
-    }
-    bool complete_query_bits = false;
-    AsciiBits query_bits = ascii_bits_for_query(query, &complete_query_bits);
-
-    uint64_t emitted = 0;
-    while (line_no >= 1 && emitted < limit) {
-        LineView line = line_at_offset(mapped->data, mapped->size, offset);
-        LineView effective = effective_search_line(line);
-        if ((!complete_query_bits ||
-             ascii_bits_may_contain(ascii_bits_for_text(effective.start, effective.len), query_bits)) &&
-            bmh_find(&searcher, effective.start, effective.len) != NULL) {
-            emit_line("match", line_no, (uint64_t)offset, false, line);
-            emitted++;
-        }
-        if (line_no == 1) {
-            break;
-        }
-
-        size_t prev_offset = 0;
-        if (!prev_line_start(mapped, offset, &prev_offset)) {
-            break;
-        }
-        offset = prev_offset;
-        line_no--;
-    }
-
-    bmh_destroy(&searcher);
-    return 0;
-}
-
-static int run_context_direct(const MappedFile *mapped,
-                              uint64_t target_line,
-                              uint64_t before,
-                              uint64_t after) {
-    if (mapped->size == 0) {
-        return 0;
-    }
-
-    uint64_t first_line = target_line > before ? target_line - before : 1;
-    uint64_t last_line = UINT64_MAX - target_line < after ? UINT64_MAX : target_line + after;
-
-    uint64_t line_no = 0;
-    size_t offset = 0;
-    if (!direct_line_start(mapped, first_line, &line_no, &offset)) {
-        return 0;
-    }
-
-    while (line_no <= last_line) {
-        LineView line = line_at_offset(mapped->data, mapped->size, offset);
-        emit_line("context", line_no, (uint64_t)offset, line_no == target_line, line);
-
-        size_t next_offset = 0;
-        if (!next_line_start(mapped, offset, &next_offset)) {
-            break;
-        }
-        offset = next_offset;
-        line_no++;
-    }
-    return 0;
-}
-
-static int cmd_match(int argc, char **argv) {
-    const char *path = NULL;
-    const char *query = NULL;
-    uint64_t from_line = 1;
-    uint64_t before_line = 0;
-    uint64_t limit = 20;
-    bool has_from_line = false;
-    bool has_before_line = false;
-
-    for (int i = 2; i < argc; i++) {
-        if (strcmp(argv[i], "--file") == 0 && i + 1 < argc) {
-            path = argv[++i];
-        } else if (strcmp(argv[i], "--query") == 0 && i + 1 < argc) {
-            query = argv[++i];
-        } else if (strcmp(argv[i], "--from-line") == 0 && i + 1 < argc) {
-            if (!parse_u64(argv[++i], &from_line) || from_line == 0) {
-                fprintf(stderr, "invalid --from-line\n");
-                return 2;
-            }
-            has_from_line = true;
-        } else if (strcmp(argv[i], "--before-line") == 0 && i + 1 < argc) {
-            if (!parse_u64(argv[++i], &before_line) || before_line == 0) {
-                fprintf(stderr, "invalid --before-line\n");
-                return 2;
-            }
-            has_before_line = true;
-        } else if (strcmp(argv[i], "--limit") == 0 && i + 1 < argc) {
-            if (!parse_u64(argv[++i], &limit)) {
-                fprintf(stderr, "invalid --limit\n");
-                return 2;
-            }
-        } else {
-            usage(stderr);
-            return 2;
-        }
-    }
-
-    if (path == NULL || query == NULL || query[0] == '\0') {
-        usage(stderr);
-        return 2;
-    }
-    if (has_from_line && has_before_line) {
-        fprintf(stderr, "--from-line and --before-line are mutually exclusive\n");
-        return 2;
-    }
-    if (limit == 0) {
-        return 0;
-    }
-
-    MappedFile mapped;
-    if (map_file(path, &mapped) != 0) {
-        return 1;
-    }
-
-    int result = has_before_line
-        ? run_match_backward_direct(&mapped, query, before_line, limit)
-        : run_match_forward_direct(&mapped, query, from_line, limit);
-    unmap_file(&mapped);
-    return result;
-}
-
-static int cmd_context(int argc, char **argv) {
-    const char *path = NULL;
-    uint64_t target_line = 0;
-    uint64_t before = 0;
-    uint64_t after = 0;
-
-    for (int i = 2; i < argc; i++) {
-        if (strcmp(argv[i], "--file") == 0 && i + 1 < argc) {
-            path = argv[++i];
-        } else if (strcmp(argv[i], "--line") == 0 && i + 1 < argc) {
-            if (!parse_u64(argv[++i], &target_line) || target_line == 0) {
-                fprintf(stderr, "invalid --line\n");
-                return 2;
-            }
-        } else if (strcmp(argv[i], "--context") == 0 && i + 1 < argc) {
-            uint64_t context = 0;
-            if (!parse_u64(argv[++i], &context)) {
-                fprintf(stderr, "invalid --context\n");
-                return 2;
-            }
-            before = context;
-            after = context;
-        } else if (strcmp(argv[i], "--before") == 0 && i + 1 < argc) {
-            if (!parse_u64(argv[++i], &before)) {
-                fprintf(stderr, "invalid --before\n");
-                return 2;
-            }
-        } else if (strcmp(argv[i], "--after") == 0 && i + 1 < argc) {
-            if (!parse_u64(argv[++i], &after)) {
-                fprintf(stderr, "invalid --after\n");
-                return 2;
-            }
-        } else {
-            usage(stderr);
-            return 2;
-        }
-    }
-
-    if (path == NULL || target_line == 0) {
-        usage(stderr);
-        return 2;
-    }
-
-    MappedFile mapped;
-    if (map_file(path, &mapped) != 0) {
-        return 1;
-    }
-
-    int result = run_context_direct(&mapped, target_line, before, after);
-    unmap_file(&mapped);
-    return result;
-}
-
-static int handle_daemon_match(const IndexedFile *indexed, char **parts, int count) {
-    if (count != 5) {
+static int handle_daemon_match(const TraceStore *store,
+                               char **parts,
+                               int count) {
+    if (count != 6) {
         return emit_daemon_end("error", "invalid match command");
+    }
+
+    uint32_t file_id = 0;
+    if (!parse_u32(parts[1], &file_id)) {
+        return emit_daemon_end("error", "invalid file id");
     }
 
     uint64_t from_line = 0;
     uint64_t before_line = 0;
     uint64_t limit = 0;
-    if (!parse_u64(parts[1], &from_line) ||
-        !parse_u64(parts[2], &before_line) ||
-        !parse_u64(parts[3], &limit)) {
+    if (!parse_u64(parts[2], &from_line) ||
+        !parse_u64(parts[3], &before_line) ||
+        !parse_u64(parts[4], &limit)) {
         return emit_daemon_end("error", "invalid numeric match argument");
     }
+    if (limit == 0) {
+        return emit_daemon_end("ok", NULL);
+    }
+
     if ((from_line == 0 && before_line == 0) || (from_line != 0 && before_line != 0)) {
         return emit_daemon_end("error", "match requires exactly one of from_line or before_line");
     }
 
-    char *query = hex_decode_to_cstr(parts[4]);
+    char *query = hex_decode_to_cstr(parts[5]);
     if (query == NULL || query[0] == '\0') {
         free(query);
         return emit_daemon_end("error", "invalid or empty query");
     }
 
-    int result = 0;
-    if (indexed->search_pool != NULL && indexed->search_pool->thread_count > 1) {
-        result = before_line != 0
-            ? run_match_backward_parallel(indexed, query, before_line, limit)
-            : run_match_forward_parallel(indexed, query, from_line, limit);
-    } else {
-        result = before_line != 0
-            ? run_match_backward(indexed, query, before_line, limit)
-            : run_match_forward(indexed, query, from_line, limit);
+    IndexedFile *file = trace_store_get_file(store, file_id);
+    if (file == NULL) {
+        free(query);
+        return emit_daemon_end("error", "file id not found");
     }
+    int result = run_match_single_file(store, file, query, from_line, before_line, limit);
+
     free(query);
     if (result != 0) {
         return emit_daemon_end("error", "match failed");
@@ -1475,22 +1249,56 @@ static int handle_daemon_match(const IndexedFile *indexed, char **parts, int cou
     return emit_daemon_end("ok", NULL);
 }
 
-static int handle_daemon_context(const IndexedFile *indexed, char **parts, int count) {
-    if (count != 4) {
+static int handle_daemon_trace_all_search(const TraceStore *store,
+                                          MultiFileThreadPool *pool,
+                                          char **parts,
+                                          int count) {
+    if (count != 3) {
+        return emit_daemon_end("error", "invalid trace_all_search command");
+    }
+
+    uint64_t limit = 0;
+    if (!parse_u64(parts[1], &limit) || limit < 1 || limit > 10) {
+        return emit_daemon_end("error", "trace_all_search limit must be between 1 and 10");
+    }
+
+    char *query = hex_decode_to_cstr(parts[2]);
+    if (query == NULL || query[0] == '\0') {
+        free(query);
+        return emit_daemon_end("error", "invalid or empty query");
+    }
+
+    int result = run_match_all_files(store, pool, query, limit);
+    free(query);
+    if (result != 0) {
+        return emit_daemon_end("error", "trace_all_search failed");
+    }
+    return emit_daemon_end("ok", NULL);
+}
+
+static int handle_daemon_context(const TraceStore *store, char **parts, int count) {
+    if (count != 5) {
         return emit_daemon_end("error", "invalid context command");
     }
 
+    uint32_t file_id = 0;
     uint64_t line = 0;
     uint64_t before = 0;
     uint64_t after = 0;
-    if (!parse_u64(parts[1], &line) ||
-        !parse_u64(parts[2], &before) ||
-        !parse_u64(parts[3], &after) ||
+    if (!parse_u32(parts[1], &file_id) ||
+        !parse_u64(parts[2], &line) ||
+        !parse_u64(parts[3], &before) ||
+        !parse_u64(parts[4], &after) ||
         line == 0) {
         return emit_daemon_end("error", "invalid numeric context argument");
     }
 
-    int result = run_context(indexed, line, before, after);
+    IndexedFile *file = trace_store_get_file(store, file_id);
+    if (file == NULL) {
+        return emit_daemon_end("error", "file id not found");
+    }
+
+    int result = run_context(file, line, before, after);
     if (result != 0) {
         return emit_daemon_end("error", "context failed");
     }
@@ -1498,31 +1306,43 @@ static int handle_daemon_context(const IndexedFile *indexed, char **parts, int c
 }
 
 static int cmd_daemon(int argc, char **argv) {
-    const char *path = NULL;
+    const char *dir_path = NULL;
 
+    if (argc == 3 && strcmp(argv[2], "--help") != 0 && strcmp(argv[1], "daemon") == 0) {
+        dir_path = argv[2];
+    }
     for (int i = 2; i < argc; i++) {
-        if (strcmp(argv[i], "--file") == 0 && i + 1 < argc) {
-            path = argv[++i];
-        } else {
+        if (strcmp(argv[i], "--dir") == 0 && i + 1 < argc) {
+            dir_path = argv[++i];
+        } else if (strcmp(argv[i], "--help") == 0) {
+            usage(stdout);
+            return 0;
+        } else if (i != 2 || dir_path == NULL || strcmp(argv[1], "daemon") != 0) {
             usage(stderr);
             return 2;
         }
     }
 
-    if (path == NULL) {
+    if (dir_path == NULL) {
         usage(stderr);
         return 2;
     }
 
-    IndexedFile indexed;
-    if (indexed_file_open(path, &indexed) != 0) {
+    TraceStore store;
+    if (trace_store_open_dir(dir_path, &store) != 0) {
         return 1;
     }
 
-    printf("{\"type\":\"daemon_ready\",\"status\":\"ok\",\"line_count\":%" PRIu64
+    MultiFileThreadPool *pool = search_pool_create(default_search_thread_count());
+    if (pool == NULL) {
+        trace_store_destroy(&store);
+        return 1;
+    }
+
+    printf("{\"type\":\"daemon_ready\",\"status\":\"ok\",\"file_count\":%" PRIu32
            ",\"search_threads\":%" PRIu32 "}\n",
-           indexed.index.count,
-           indexed.search_pool == NULL ? 0 : indexed.search_pool->thread_count);
+           store.count,
+           pool->thread_count);
     fflush(stdout);
 
     char command[65536];
@@ -1538,11 +1358,11 @@ static int cmd_daemon(int argc, char **argv) {
             break;
         }
 
-        char *parts[6] = {0};
+        char *parts[7] = {0};
         int count = 0;
         char *saveptr = NULL;
         char *token = strtok_r(command, "\t", &saveptr);
-        while (token != NULL && count < 6) {
+        while (token != NULL && count < 7) {
             parts[count++] = token;
             token = strtok_r(NULL, "\t", &saveptr);
         }
@@ -1551,16 +1371,21 @@ static int cmd_daemon(int argc, char **argv) {
             continue;
         }
 
-        if (count > 0 && strcmp(parts[0], "match") == 0) {
-            handle_daemon_match(&indexed, parts, count);
+        if (count > 0 && strcmp(parts[0], "list") == 0) {
+            handle_daemon_list(&store);
+        } else if (count > 0 && strcmp(parts[0], "trace_all_search") == 0) {
+            handle_daemon_trace_all_search(&store, pool, parts, count);
+        } else if (count > 0 && strcmp(parts[0], "match") == 0) {
+            handle_daemon_match(&store, parts, count);
         } else if (count > 0 && strcmp(parts[0], "context") == 0) {
-            handle_daemon_context(&indexed, parts, count);
+            handle_daemon_context(&store, parts, count);
         } else {
             emit_daemon_end("error", "unknown daemon command");
         }
     }
 
-    indexed_file_close(&indexed);
+    search_pool_destroy(pool);
+    trace_store_destroy(&store);
     return 0;
 }
 
@@ -1605,12 +1430,6 @@ int main(int argc, char **argv) {
     if (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0) {
         usage(stdout);
         return 0;
-    }
-    if (strcmp(argv[1], "match") == 0) {
-        return cmd_match(argc, argv);
-    }
-    if (strcmp(argv[1], "context") == 0) {
-        return cmd_context(argc, argv);
     }
     if (strcmp(argv[1], "daemon") == 0) {
         return cmd_daemon(argc, argv);

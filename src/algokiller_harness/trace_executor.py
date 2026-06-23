@@ -36,6 +36,10 @@ class LocalTraceToolExecutor:
 
     def execute(self, name: str, arguments: dict[str, Any]) -> str:
         try:
+            if name == "trace_files":
+                return self._trace_files()
+            if name == "trace_all_search":
+                return self._all_search(arguments)
             if name == "trace_search":
                 return self._trace_search(arguments)
             if name == "trace_context":
@@ -84,8 +88,9 @@ class LocalTraceToolExecutor:
 
         self._close_search_daemon()
         self._ensure_search_bin()
+        trace_dir = self.trace_file if self.trace_file.is_dir() else self.trace_file.parent
         daemon = subprocess.Popen(
-            [str(self.search_bin), "daemon", "--file", str(self.trace_file)],
+            [str(self.search_bin), "daemon", "--dir", str(trace_dir)],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -216,9 +221,30 @@ class LocalTraceToolExecutor:
             raise ValueError(f"{name} must be <= {maximum}")
         return result
 
-    def _trace_search_once(self, query: str, *, from_line: int = 0, before_line: int = 0, limit: int) -> str:
+    def _trace_files(self) -> str:
+        return self._daemon_request("list", max_output_chars=30000)
+
+    def _trace_search_once(
+        self,
+        query: str,
+        *,
+        file_id: str,
+        from_line: int = 0,
+        before_line: int = 0,
+        limit: int,
+    ) -> str:
         query_hex = query.encode("utf-8").hex()
-        return self._daemon_request(f"match\t{from_line}\t{before_line}\t{limit}\t{query_hex}", max_output_chars=30000)
+        return self._daemon_request(
+            f"match\t{file_id}\t{from_line}\t{before_line}\t{limit}\t{query_hex}",
+            max_output_chars=30000,
+        )
+
+    def _all_search_once(self, query: str, *, limit: int) -> str:
+        query_hex = query.encode("utf-8").hex()
+        return self._daemon_request(
+            f"trace_all_search\t{limit}\t{query_hex}",
+            max_output_chars=30000,
+        )
 
     def _search_result_has_matches(self, result_json: str) -> bool:
         result = json.loads(result_json)
@@ -261,6 +287,10 @@ class LocalTraceToolExecutor:
         query = str(arguments["query"])
         if not query:
             raise ValueError("query must not be empty")
+        if "file_id" not in arguments:
+            raise ValueError("file_id is required")
+        file_id_int = self._positive_int(arguments["file_id"], 1, "file_id")
+        file_id = str(file_id_int)
         has_from_line = "from_line" in arguments
         has_before_line = "before_line" in arguments
         if has_from_line == has_before_line:
@@ -268,21 +298,48 @@ class LocalTraceToolExecutor:
         limit = self._required_positive_int(arguments, "limit", 100)
         if has_before_line:
             before_line = self._required_positive_int(arguments, "before_line")
-            result = self._trace_search_once(query, before_line=before_line, limit=limit)
+            result = self._trace_search_once(query, file_id=file_id, before_line=before_line, limit=limit)
             if not self._search_result_is_empty_success(result):
                 return result
             for fallback_query in self._hex_search_fallback_queries(query):
-                fallback_result = self._trace_search_once(fallback_query, before_line=before_line, limit=limit)
+                fallback_result = self._trace_search_once(
+                    fallback_query,
+                    file_id=file_id,
+                    before_line=before_line,
+                    limit=limit,
+                )
                 if self._search_result_has_matches(fallback_result):
                     return fallback_result
             return result
 
         from_line = self._required_positive_int(arguments, "from_line")
-        result = self._trace_search_once(query, from_line=from_line, limit=limit)
+        result = self._trace_search_once(query, file_id=file_id, from_line=from_line, limit=limit)
         if not self._search_result_is_empty_success(result):
             return result
         for fallback_query in self._hex_search_fallback_queries(query):
-            fallback_result = self._trace_search_once(fallback_query, from_line=from_line, limit=limit)
+            fallback_result = self._trace_search_once(
+                fallback_query,
+                file_id=file_id,
+                from_line=from_line,
+                limit=limit,
+            )
+            if self._search_result_has_matches(fallback_result):
+                return fallback_result
+        return result
+
+    def _all_search(self, arguments: dict[str, Any]) -> str:
+        extra_args = set(arguments) - {"query", "limit"}
+        if extra_args:
+            raise ValueError(f"trace_all_search only supports query and limit; unexpected: {', '.join(sorted(extra_args))}")
+        query = str(arguments["query"])
+        if not query:
+            raise ValueError("query must not be empty")
+        limit = self._required_positive_int(arguments, "limit", 10)
+        result = self._all_search_once(query, limit=limit)
+        if not self._search_result_is_empty_success(result):
+            return result
+        for fallback_query in self._hex_search_fallback_queries(query):
+            fallback_result = self._all_search_once(fallback_query, limit=limit)
             if self._search_result_has_matches(fallback_result):
                 return fallback_result
         return result
@@ -290,6 +347,7 @@ class LocalTraceToolExecutor:
     def _trace_context(self, arguments: dict[str, Any]) -> str:
         if "context" in arguments:
             raise ValueError("context is no longer supported; use before and after")
+        file_id = self._required_positive_int(arguments, "file_id")
         line = self._required_positive_int(arguments, "line")
         if "before" not in arguments:
             raise ValueError("before is required")
@@ -297,4 +355,7 @@ class LocalTraceToolExecutor:
             raise ValueError("after is required")
         before_count = self._bounded_non_negative_int(arguments.get("before"), 0, "before", 100)
         after_count = self._bounded_non_negative_int(arguments.get("after"), 0, "after", 100)
-        return self._daemon_request(f"context\t{line}\t{before_count}\t{after_count}", max_output_chars=30000)
+        return self._daemon_request(
+            f"context\t{file_id}\t{line}\t{before_count}\t{after_count}",
+            max_output_chars=30000,
+        )

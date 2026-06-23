@@ -48,6 +48,10 @@ def restore_trace_file(data: dict[str, Any]) -> str | None:
     return _startup_value(data, "trace_file") or _config_value(data, "trace_file")
 
 
+def restore_trace_dir(data: dict[str, Any]) -> str | None:
+    return _startup_value(data, "trace_dir") or _config_value(data, "trace_dir")
+
+
 def restore_mode(data: dict[str, Any]) -> str | None:
     return _startup_value(data, "mode") or _config_value(data, "mode")
 
@@ -117,7 +121,8 @@ def _startup_snapshot(args: Namespace) -> dict[str, Any]:
         "argv": sys.argv[1:],
         "prompt": list(args.prompt or []),
         "interactive": bool(args.interactive),
-        "trace_file": args.trace_file,
+        "trace_file": getattr(args, "trace_file", None),
+        "trace_dir": getattr(args, "trace_dir", None),
         "mode": args.mode,
         "resume_session": args.resume_session,
     }
@@ -132,6 +137,7 @@ def _config_snapshot(config: HarnessConfig) -> dict[str, Any]:
         "api_base": config.api_base,
         "api_key_configured": bool(config.api_key),
         "trace_file": str(config.trace_file),
+        "trace_dir": str(config.trace_dir),
         "mode": config.mode,
         "artifacts_dir": str(config.artifacts_dir),
         "max_tokens": config.max_tokens,

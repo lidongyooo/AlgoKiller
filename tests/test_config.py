@@ -1,3 +1,5 @@
+import pytest
+
 from algokiller_harness.config import load_config
 
 
@@ -49,6 +51,32 @@ def test_model_defaults_to_openai_gpt5(tmp_path, monkeypatch):
     assert config.provider == "openai"
     assert config.model_name == "gpt-5.4"
     assert config.model == "openai/gpt-5.4"
+    assert config.trace_file == trace_file.resolve()
+    assert config.trace_dir == tmp_path.resolve()
+
+
+def test_trace_dir_can_be_used_as_startup_trace_path(tmp_path, monkeypatch):
+    trace_dir = tmp_path / "traces"
+    trace_dir.mkdir()
+    _clear_model_env(monkeypatch)
+    monkeypatch.chdir(tmp_path)
+
+    config = load_config(trace_dir=str(trace_dir), mode="ciphertext")
+
+    assert config.trace_file == trace_dir.resolve()
+    assert config.trace_dir == trace_dir.resolve()
+
+
+def test_trace_file_and_trace_dir_are_mutually_exclusive(tmp_path, monkeypatch):
+    trace_file = tmp_path / "sample.trace"
+    trace_dir = tmp_path / "traces"
+    trace_file.write_text("", encoding="utf-8")
+    trace_dir.mkdir()
+    _clear_model_env(monkeypatch)
+    monkeypatch.chdir(tmp_path)
+
+    with pytest.raises(ValueError, match="--trace-file and --trace-dir"):
+        load_config(trace_file=str(trace_file), trace_dir=str(trace_dir), mode="ciphertext")
 
 
 def test_model_can_switch_to_anthropic_with_provider_and_name(tmp_path, monkeypatch):
