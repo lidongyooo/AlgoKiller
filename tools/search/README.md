@@ -11,7 +11,13 @@ make
 
 ## Exact Match
 
-Return lines containing an exact string. Matching is ASCII case-insensitive: the query is folded to lowercase once, and file bytes are folded during scan without materializing a lowercase copy of the file. Line numbers are 1-based.
+Return lines containing an exact string. Matching is ASCII case-insensitive:
+the query is folded to lowercase once, and file bytes are folded during scan
+without materializing a lowercase copy of the file. Line numbers are 1-based.
+
+For instruction trace rows whose first byte is `[`, search ignores the prefix
+through the first `!` character. The full row is still returned when the
+post-`!` searchable region matches.
 
 ```bash
 ./ak_search match --file trace.log --query "x0=0x1234" --from-line 1000000 --limit 20
@@ -38,8 +44,19 @@ Output is JSONL:
 
 ## Daemon
 
-The harness uses daemon mode to mmap the trace and build a line-offset index once,
-then reuse the same process for repeated `match` and `context` calls.
+The harness uses daemon mode to mmap the trace and build indexes once, then
+reuse the same process for repeated `match` and `context` calls.
+
+Daemon indexes:
+
+- line number -> byte offset;
+- 128-bit ASCII presence bitmap per searchable line region.
+
+Each `match` first checks whether the line bitmap can contain all ASCII bytes in
+the query, then falls back to line-local BMH only for candidate rows. The bitmap
+subset check uses inline assembly on supported targets. Daemon mode starts a
+persistent search worker pool sized to half the online CPU cores; workers are
+reused across searches. `context` remains single-threaded.
 
 ```bash
 ./ak_search daemon --file trace.log

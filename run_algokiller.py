@@ -24,7 +24,7 @@ _disable_import_cache()
 from algokiller_harness.cli import main  # noqa: E402
 
 
-DEFAULT_TRACE_FILE = "/your_path/trace.log"
+DEFAULT_TRACE_FILE = "/Users/lidongyooo/custom/tiktok/traces/trace_1009_main.log"
 DEFAULT_MODE = "ciphertext"
 
 
